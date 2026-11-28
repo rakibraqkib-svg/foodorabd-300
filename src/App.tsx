@@ -18,6 +18,8 @@ import {
   LogOut,
   Mail,
   MapPin,
+  MessageCircle,
+  Phone,
   Plus,
   Search,
   Shield,
@@ -52,16 +54,21 @@ import {
   useRealtimeEvents,
 } from './lib/realtime';
 import {
+  buildMessengerUrl,
   buildRestaurantUnavailableMessage,
+  buildWhatsAppSupportUrl,
   canAddToSingleRestaurantCart,
   type CartItemInput,
+  type DeliveryFinancialConfig,
   filterStorefrontProducts,
   formatBdt,
+  formatDurationEstimate,
   shouldRestoreTrackedOrderShortcut,
 } from './lib/marketplace-logic';
 import { mergeStorefrontConfig } from './lib/storefront-config';
 import type {
   Coupon,
+  DhakaZoneCoverageItem,
   FoodItem,
   Lang,
   NotificationItem,
@@ -132,6 +139,9 @@ function MarketplaceApp() {
   );
   const [publicSettings, setPublicSettings] = useState<PlatformSettings | null>(null);
   const [publicGateways, setPublicGateways] = useState<PublicPaymentGateway[]>([]);
+  const [deliveryFinancialConfig, setDeliveryFinancialConfig] =
+    useState<DeliveryFinancialConfig | null>(null);
+  const [dhakaZoneCoverage, setDhakaZoneCoverage] = useState<DhakaZoneCoverageItem[]>([]);
   const [gmpQuotaBanner, setGmpQuotaBanner] = useState(false);
 
   const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
@@ -175,6 +185,13 @@ function MarketplaceApp() {
     displayName?: string;
   }>(() => {
     try {
+      const areaParam = new URLSearchParams(window.location.search).get('area')?.trim();
+      if (areaParam) {
+        const matchedArea = BANGLADESH_AREAS.find(
+          (a) => a.name.toLowerCase() === areaParam.toLowerCase()
+        );
+        if (matchedArea) return matchedArea;
+      }
       const raw = localStorage.getItem(STORAGE_AREA_KEY);
       if (raw) return JSON.parse(raw);
     } catch {
@@ -185,6 +202,12 @@ function MarketplaceApp() {
   const [locationModalOpen, setLocationModalOpen] = useState(false);
   const [locationModalTab, setLocationModalTab] = useState<'map' | 'zones'>('map');
   const [locationZoneFilter, setLocationZoneFilter] = useState<string>('all');
+  const [locationRouteOrigin, setLocationRouteOrigin] = useState<{
+    name: string;
+    nameBn: string;
+    lat: number;
+    lng: number;
+  } | null>(null);
   const [emailTrackModalOpen, setEmailTrackModalOpen] = useState(false);
   const [trackEmailInput, setTrackEmailInput] = useState('');
   const [trackOrderNumInput, setTrackOrderNumInput] = useState('');
@@ -208,8 +231,20 @@ function MarketplaceApp() {
 
   // Filters
   const [fulfillmentTab, setFulfillmentTab] = useState<'delivery' | 'pickup'>('delivery');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedCuisine, setSelectedCuisine] = useState('All');
+  const [searchQuery, setSearchQuery] = useState(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('q')?.trim() || '';
+    } catch {
+      return '';
+    }
+  });
+  const [selectedCuisine, setSelectedCuisine] = useState(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('cuisine')?.trim() || 'All';
+    } catch {
+      return 'All';
+    }
+  });
   const [sortBy, setSortBy] = useState<'relevance' | 'rating' | 'fastest' | 'lowFee'>('relevance');
   const [onlyDiscount, setOnlyDiscount] = useState(false);
   const [onlyFreeFirst, setOnlyFreeFirst] = useState(false);
@@ -431,6 +466,8 @@ function MarketplaceApp() {
           mapsApiKey: string;
           settings?: PlatformSettings | null;
           paymentGateways?: PublicPaymentGateway[];
+          deliveryFinancialConfig?: DeliveryFinancialConfig | null;
+          dhakaZoneCoverage?: DhakaZoneCoverageItem[];
           featuredActiveOrder?: TrackedOrderShortcut | null;
         }>('/api/public-config'),
         apiFetch<{ restaurants: Restaurant[] }>('/api/restaurants'),
@@ -442,6 +479,10 @@ function MarketplaceApp() {
       );
       setPublicSettings(cfgRes.settings || null);
       setPublicGateways(cfgRes.paymentGateways || []);
+      setDeliveryFinancialConfig(
+        cfgRes.deliveryFinancialConfig || cfgRes.settings?.deliveryFinancialConfig || null
+      );
+      setDhakaZoneCoverage(cfgRes.dhakaZoneCoverage || []);
       setFeaturedActiveOrder(cfgRes.featuredActiveOrder || null);
       setRestaurants(restRes.restaurants);
       setStorefrontProducts(prodRes.products || []);
@@ -539,6 +580,14 @@ function MarketplaceApp() {
       upsertMeta('property', 'og:title', pageTitle);
       upsertMeta('property', 'og:description', pageDesc);
       upsertMeta('property', 'og:url', canonicalUrl);
+      upsertMeta(
+        'property',
+        'og:image',
+        activeRestaurant?.coverUrl || `${window.location.origin}${sc.heroImageUrl}`
+      );
+      upsertMeta('name', 'twitter:card', 'summary_large_image');
+      upsertMeta('name', 'twitter:title', pageTitle);
+      upsertMeta('name', 'twitter:description', pageDesc);
 
       const scriptId = 'foodora-seo-jsonld';
       let jsonLdEl = document.getElementById(scriptId) as HTMLScriptElement | null;
@@ -561,6 +610,27 @@ function MarketplaceApp() {
               target: `${window.location.origin}/?q={search_term_string}`,
               'query-input': 'required name=search_term_string',
             },
+          },
+          {
+            '@type': 'FAQPage',
+            mainEntity: [
+              {
+                '@type': 'Question',
+                name: 'How does food delivery work on Foodora BD?',
+                acceptedAnswer: {
+                  '@type': 'Answer',
+                  text: 'Add dishes from Dhaka or any Bangladesh restaurant to your cart, where Pathao Food, Foodora Express Rider, Steadfast, or RedX delivery is automatically calculated, then pay via bKash, Nagad, SSLCommerz, or Cash on Delivery.',
+                },
+              },
+              {
+                '@type': 'Question',
+                name: 'Which cities in Bangladesh are covered for online food orders?',
+                acceptedAnswer: {
+                  '@type': 'Answer',
+                  text: 'Foodora BD covers Gulshan, Banani, Dhanmondi, Uttara, Mirpur, Chattogram, Sylhet, Rajshahi, Khulna, and nationwide delivery areas across Bangladesh.',
+                },
+              },
+            ],
           },
           {
             '@type': 'ItemList',
@@ -663,10 +733,20 @@ function MarketplaceApp() {
       const cfgRes = await apiFetch<{
         featuredActiveOrder?: TrackedOrderShortcut | null;
         settings?: PlatformSettings | null;
+        deliveryFinancialConfig?: DeliveryFinancialConfig | null;
+        dhakaZoneCoverage?: DhakaZoneCoverageItem[];
       }>('/api/public-config');
       setFeaturedActiveOrder(cfgRes.featuredActiveOrder || null);
       if (cfgRes.settings) {
         setPublicSettings(cfgRes.settings);
+      }
+      if (cfgRes.deliveryFinancialConfig || cfgRes.settings?.deliveryFinancialConfig) {
+        setDeliveryFinancialConfig(
+          cfgRes.deliveryFinancialConfig || cfgRes.settings?.deliveryFinancialConfig || null
+        );
+      }
+      if (cfgRes.dhakaZoneCoverage) {
+        setDhakaZoneCoverage(cfgRes.dhakaZoneCoverage);
       }
     } catch {
       // ignore non-critical background refresh
@@ -1309,6 +1389,12 @@ function MarketplaceApp() {
             <button
               type="button"
               onClick={() => {
+                setLocationRouteOrigin({
+                  name: selectedArea.name,
+                  nameBn: selectedArea.nameBn,
+                  lat: selectedArea.lat,
+                  lng: selectedArea.lng,
+                });
                 setLocationModalTab('map');
                 setLocationModalOpen(true);
               }}
@@ -1790,6 +1876,7 @@ function MarketplaceApp() {
               reviews={detailData.reviews}
               lang={lang}
               mapsApiKey={mapsApiKey}
+              selectedArea={selectedArea}
               isFavorited={favoriteIds.includes(detailData.restaurant.id)}
               onToggleFavorite={handleToggleFavorite}
               onAddToCart={(item) => handleAddToCart(detailData.restaurant, item)}
@@ -2142,8 +2229,8 @@ function MarketplaceApp() {
                           {bannerOrder.estimatedMinutes
                             ? ` · ${
                                 lang === 'bn'
-                                  ? `প্রায় ${Math.min(Math.max(bannerOrder.estimatedMinutes, 8), 90)} মিনিট`
-                                  : `~${Math.min(Math.max(bannerOrder.estimatedMinutes, 8), 90)} min ETA`
+                                  ? `প্রায় ${formatDurationEstimate(Math.max(bannerOrder.estimatedMinutes, 8), 'bn')}`
+                                  : `~${formatDurationEstimate(Math.max(bannerOrder.estimatedMinutes, 8), 'en', 'compact')} ETA`
                               }`
                             : ''}
                         </p>
@@ -2174,6 +2261,12 @@ function MarketplaceApp() {
                   <button
                     type="button"
                     onClick={() => {
+                      setLocationRouteOrigin({
+                        name: selectedArea.name,
+                        nameBn: selectedArea.nameBn,
+                        lat: selectedArea.lat,
+                        lng: selectedArea.lng,
+                      });
                       setLocationModalTab('map');
                       setLocationModalOpen(true);
                     }}
@@ -2403,7 +2496,7 @@ function MarketplaceApp() {
                                   {lang === 'bn' ? product.restaurantNameBn : product.restaurantName}
                                 </span>
                                 <span>·</span>
-                                <span className="tabular-nums shrink-0">{product.deliveryTimeMin}m</span>
+                                <span className="tabular-nums shrink-0">{formatDurationEstimate(product.deliveryTimeMin, lang, 'compact')}</span>
                               </button>
                             </div>
 
@@ -2726,7 +2819,7 @@ function MarketplaceApp() {
                             </div>
 
                             <p className="text-xs text-neutral-500 truncate tabular-nums">
-                              {rest.deliveryTimeMin} {t(lang, 'minFrom')} · {rest.priceTier} · {rest.cuisine} · {rest.area}
+                              {formatDurationEstimate(rest.deliveryTimeMin, lang)} · {rest.priceTier} · {rest.cuisine} · {rest.area}
                             </p>
 
                             <p className="text-xs font-semibold text-[#E21B70] inline-flex items-center gap-1.5 tabular-nums">
@@ -2887,10 +2980,42 @@ function MarketplaceApp() {
 
             <div className="space-y-1.5">
               <p className="font-bold text-[#2E3138] text-sm">
-                {lang === 'bn' ? 'পেমেন্ট ও ডেলিভারি' : 'Payments & Couriers'}
+                {lang === 'bn' ? 'যোগাযোগ ও লাইভ সাপোর্ট' : 'Contact & Live Support'}
               </p>
-              <p>bKash · Nagad · SSLCommerz · Cash on Delivery</p>
-              <p>Foodora Own Riders · Pathao Courier</p>
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent('foodora:open-live-chat'))}
+                className="flex items-center gap-1.5 font-semibold text-[#E21B70] hover:underline"
+              >
+                <MessageCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>{lang === 'bn' ? 'Website Live Chat (AI + হেল্প)' : 'Website Live Chat (AI + Help)'}</span>
+              </button>
+              <a
+                href={buildMessengerUrl(sc.messengerUrl)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 font-semibold text-neutral-700 hover:text-[#E21B70] transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5 shrink-0 text-[#0084FF]" />
+                <span>{lang === 'bn' ? 'Facebook Messenger সাপোর্ট' : 'Facebook Messenger Support'}</span>
+              </a>
+              <a
+                href={buildWhatsAppSupportUrl(
+                  sc.whatsappNumber,
+                  lang === 'bn'
+                    ? 'আসসালামু আলাইকুম, Foodora BD WhatsApp সাপোর্টে সাহায্য প্রয়োজন।'
+                    : 'Hello Foodora BD Support, I need assistance.'
+                )}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 font-semibold text-neutral-700 hover:text-[#E21B70] transition-colors"
+              >
+                <Phone className="w-3.5 h-3.5 shrink-0 text-[#16A34A]" />
+                <span>WhatsApp: {sc.whatsappNumber || '+8801712345678'}</span>
+              </a>
+              <p className="text-[11px] text-neutral-500 pt-1">
+                bKash · Nagad · SSLCommerz · COD · Foodora &amp; Pathao
+              </p>
             </div>
           </div>
         </div>
@@ -2909,6 +3034,8 @@ function MarketplaceApp() {
         customerName={user?.fullName || ''}
         customerEmail={user?.isSandbox ? '' : user?.email || ''}
         paymentGateways={publicGateways}
+        deliveryFinancialConfig={deliveryFinancialConfig}
+        dhakaZoneCoverage={dhakaZoneCoverage}
         onUpdateQty={handleUpdateQty}
         onRemoveItem={handleRemoveCartItem}
         onClearCart={handleClearCart}
@@ -3101,10 +3228,53 @@ function MarketplaceApp() {
                 mapsApiKey={mapsApiKey}
                 lang={lang}
                 center={{ lat: selectedArea.lat, lng: selectedArea.lng }}
-                markerLabel={selectedArea.name}
+                markerLabel={lang === 'bn' ? selectedArea.nameBn : selectedArea.name}
+                originPoint={
+                  locationRouteOrigin
+                    ? {
+                        lat: locationRouteOrigin.lat,
+                        lng: locationRouteOrigin.lng,
+                        label:
+                          lang === 'bn'
+                            ? locationRouteOrigin.nameBn || locationRouteOrigin.name
+                            : locationRouteOrigin.name,
+                      }
+                    : null
+                }
+                onSwapInteractiveRoute={
+                  locationRouteOrigin
+                    ? () => {
+                        const prevDest = { ...selectedArea };
+                        const prevStart = { ...locationRouteOrigin };
+                        setSelectedArea({
+                          name: prevStart.name,
+                          nameBn: prevStart.nameBn,
+                          lat: prevStart.lat,
+                          lng: prevStart.lng,
+                        });
+                        setLocationRouteOrigin({
+                          name: prevDest.name,
+                          nameBn: prevDest.nameBn,
+                          lat: prevDest.lat,
+                          lng: prevDest.lng,
+                        });
+                      }
+                    : undefined
+                }
+                onClearInteractiveRoute={() =>
+                  setLocationRouteOrigin({
+                    name: selectedArea.name,
+                    nameBn: selectedArea.nameBn,
+                    lat: selectedArea.lat,
+                    lng: selectedArea.lng,
+                  })
+                }
                 pinType="user"
                 userName={user?.fullName}
                 interactive
+                enableInteractivePointRoute
+                showTraffic
+                showDirectionsSummary
                 heightClass="h-[290px]"
                 onSelectLocation={(c) => {
                   const exactPreset = BANGLADESH_AREAS.find(
@@ -4271,13 +4441,16 @@ function MarketplaceApp() {
         </div>
       )}
 
-      {/* Bilingual AI Help Assistant (Bangla & English) */}
+      {/* Bilingual AI Help & Live Support (Website Live Chat + Messenger + WhatsApp) */}
       <AiHelpWidget
         uiLang={lang}
         area={selectedArea.name}
         viewType={view.type}
         activeOrderNumber={lastTrackedOrder?.orderNumber}
         accentColor={sc.accentColor}
+        messengerUrl={sc.messengerUrl}
+        whatsappNumber={sc.whatsappNumber}
+        supportEmail={sc.supportEmail}
       />
 
       {/* Audio Autoplay Unlock Prompt (only appears if browser blocked alert sound before click) */}

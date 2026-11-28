@@ -2348,6 +2348,24 @@ export function VendorDashboard({
                   ) : (
                     <div className="space-y-3">
                       {filteredOrders.map((ord) => {
+                        const isPrepaidLocked =
+                          ord.paymentMethod !== 'cod' &&
+                          ord.paymentStatus !== 'paid' &&
+                          ord.status !== 'cancelled';
+                        const isPrepaidVerified =
+                          ord.paymentMethod !== 'cod' && ord.paymentStatus === 'paid';
+                        const onlineFoodAmount =
+                          typeof ord.onlineFoodPaidAmount === 'number'
+                            ? ord.onlineFoodPaidAmount
+                            : ord.paymentMethod === 'cod'
+                            ? 0
+                            : Math.max(0, ord.totalAmount - ord.deliveryFee);
+                        const cashToRiderAmount =
+                          typeof ord.cashDueToRider === 'number'
+                            ? ord.cashDueToRider
+                            : ord.paymentMethod === 'cod'
+                            ? ord.totalAmount
+                            : ord.deliveryFee;
                         const canDispatch =
                           ord.status !== 'delivered' && ord.status !== 'cancelled';
                         const selectedRiderUid =
@@ -2355,6 +2373,7 @@ export function VendorDashboard({
                         return (
                           <div
                             key={ord.id}
+                            data-testid={`vendor-order-card-${ord.id}`}
                             className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5 space-y-3"
                           >
                             <div className="flex flex-wrap items-start justify-between gap-3">
@@ -2379,6 +2398,32 @@ export function VendorDashboard({
                                     {ord.deliveryArea} — {ord.deliveryAddress}
                                   </span>
                                 </p>
+                                <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
+                                  {isPrepaidVerified && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 font-semibold">
+                                      <ShieldCheck className="w-3 h-3" />
+                                      <span>
+                                        {lang === 'bn'
+                                          ? `অনলাইন খাবার পেমেন্ট যাচাইকৃত (${formatBdt(onlineFoodAmount, lang)})`
+                                          : `Online Food Verified (${formatBdt(onlineFoodAmount, lang)})`}
+                                      </span>
+                                    </span>
+                                  )}
+                                  {isPrepaidLocked && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 border border-amber-300 text-amber-900 font-semibold">
+                                      <span>
+                                        {lang === 'bn'
+                                          ? `প্রিপেইড পেমেন্ট বাকি (${formatBdt(onlineFoodAmount, lang)}) — প্রসেসিং লকড`
+                                          : `Prepaid Pending (${formatBdt(onlineFoodAmount, lang)}) — Locked`}
+                                      </span>
+                                    </span>
+                                  )}
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-neutral-100 border border-neutral-200 text-neutral-700 font-medium tabular-nums">
+                                    {lang === 'bn'
+                                      ? `রাইডারকে ক্যাশ (ডেলিভারি): ${formatBdt(cashToRiderAmount, lang)}`
+                                      : `Cash to Rider (Delivery): ${formatBdt(cashToRiderAmount, lang)}`}
+                                  </span>
+                                </div>
                               </div>
 
                               <div className="text-right tabular-nums shrink-0">
@@ -2402,6 +2447,14 @@ export function VendorDashboard({
                               </div>
                             </div>
 
+                            {isPrepaidLocked && (
+                              <div className="px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                                {lang === 'bn'
+                                  ? 'অনলাইনে খাবারের মূল্য পরিশোধ ও যাচাই না হওয়া পর্যন্ত অর্ডার গ্রহণ, রান্না বা রাইডার ডিসপ্যাচ করা যাবে না।'
+                                  : 'Online food payment must be verified before kitchen preparation or rider dispatch can proceed.'}
+                              </div>
+                            )}
+
                             {/* Action Bar: Kitchen Steps + Rider Assignment + Live Track */}
                             <div className="pt-3 border-t border-neutral-100 flex flex-wrap items-center justify-between gap-2.5">
                               <div className="flex flex-wrap items-center gap-2">
@@ -2409,8 +2462,9 @@ export function VendorDashboard({
                                   <>
                                     <button
                                       type="button"
+                                      disabled={isPrepaidLocked}
                                       onClick={() => handleOrderStatus(ord.id, 'accepted')}
-                                      className="px-3 py-1.5 rounded-lg bg-[#E21B70] hover:bg-[#C4135E] text-white text-xs font-semibold"
+                                      className="px-3 py-1.5 rounded-lg bg-[#E21B70] hover:bg-[#C4135E] text-white text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
                                     >
                                       {lang === 'bn' ? 'অর্ডার গ্রহণ করুন' : 'Accept Order'}
                                     </button>
@@ -2426,8 +2480,9 @@ export function VendorDashboard({
                                 {ord.status === 'accepted' && (
                                   <button
                                     type="button"
+                                    disabled={isPrepaidLocked}
                                     onClick={() => handleOrderStatus(ord.id, 'preparing')}
-                                    className="px-3 py-1.5 rounded-lg bg-[#2E3138] hover:bg-black text-white text-xs font-semibold"
+                                    className="px-3 py-1.5 rounded-lg bg-[#2E3138] hover:bg-black text-white text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
                                   >
                                     {lang === 'bn' ? 'রান্না শুরু করুন' : 'Start Preparing'}
                                   </button>
@@ -2435,8 +2490,9 @@ export function VendorDashboard({
                                 {ord.status === 'preparing' && (
                                   <button
                                     type="button"
+                                    disabled={isPrepaidLocked}
                                     onClick={() => handleOrderStatus(ord.id, 'ready')}
-                                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
                                   >
                                     {lang === 'bn' ? 'পিকআপের জন্য প্রস্তুত' : 'Mark Ready'}
                                   </button>
@@ -2447,8 +2503,9 @@ export function VendorDashboard({
                                   ord.status === 'on_the_way') && (
                                   <button
                                     type="button"
+                                    disabled={isPrepaidLocked}
                                     onClick={() => handleOrderStatus(ord.id, 'delivered')}
-                                    className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold"
+                                    className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
                                   >
                                     {lang === 'bn' ? 'ডেলিভারি সম্পন্ন' : 'Mark Delivered'}
                                   </button>
@@ -2478,6 +2535,7 @@ export function VendorDashboard({
                                   <>
                                     <select
                                       aria-label={`Assign rider for order ${ord.orderNumber}`}
+                                      disabled={isPrepaidLocked}
                                       value={selectedRiderUid}
                                       onChange={(e) =>
                                         setRiderSelectionByOrder((prev) => ({
@@ -2485,7 +2543,7 @@ export function VendorDashboard({
                                           [ord.id]: e.target.value,
                                         }))
                                       }
-                                      className="px-2.5 py-1.5 rounded-lg border border-neutral-200 bg-neutral-50 text-xs font-medium text-[#2E3138] max-w-[200px]"
+                                      className="px-2.5 py-1.5 rounded-lg border border-neutral-200 bg-neutral-50 text-xs font-medium text-[#2E3138] max-w-[200px] disabled:opacity-50"
                                     >
                                       <option value="">
                                         {lang === 'bn' ? '-- রাইডার বাছাই --' : '-- Select Rider --'}
@@ -2502,7 +2560,9 @@ export function VendorDashboard({
                                     <button
                                       type="button"
                                       disabled={
-                                        dispatchingOrderId === ord.id || !selectedRiderUid
+                                        isPrepaidLocked ||
+                                        dispatchingOrderId === ord.id ||
+                                        !selectedRiderUid
                                       }
                                       onClick={() =>
                                         handleAssignRider(ord.id, { riderUid: selectedRiderUid })
@@ -2517,7 +2577,7 @@ export function VendorDashboard({
                                     </button>
                                     <button
                                       type="button"
-                                      disabled={dispatchingOrderId === ord.id}
+                                      disabled={isPrepaidLocked || dispatchingOrderId === ord.id}
                                       onClick={() =>
                                         handleAssignRider(ord.id, { autoAssignNearest: true })
                                       }

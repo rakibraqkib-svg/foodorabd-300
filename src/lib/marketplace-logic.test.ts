@@ -13,6 +13,7 @@ import {
   estimateDeliveryFeeAndEta,
   evaluateCoupon,
   formatBdt,
+  formatDurationEstimate,
   haversineDistanceKm,
   isProtectedSuperAdminEmail,
   mapOpenMeteoWeather,
@@ -37,6 +38,7 @@ import {
   mergeCustomSelectOptions,
   pickNearestStandbyRider,
   computeOrderEtaSummary,
+  computeMapRouteTelemetry,
   buildRestaurantUnavailableMessage,
   buildAiHelpSystemInstruction,
   parseOrderSoundPreference,
@@ -84,6 +86,28 @@ import {
   AI_PROVIDER_PRESETS,
   buildMessengerUrl,
   buildWhatsAppSupportUrl,
+  extractAiReplyText,
+  coerceSafeErrorText,
+  sanitizeAiChatHistory,
+  filterGeminiCandidateModels,
+  BANGLADESH_DELIVERY_SERVICES,
+  getBangladeshDeliveryServiceMeta,
+  selectAutoBangladeshiDeliveryService,
+  summarizeTrafficCongestion,
+  formatDirectionStepDistance,
+  buildOsrmDirectionInstruction,
+  estimateDhakaPeakTrafficFactor,
+  getDeliveryVehicleMeta,
+  normalizeDeliveryVehicleMode,
+  DEFAULT_DELIVERY_FINANCIAL_CONFIG,
+  mergeDeliveryFinancialConfig,
+  matchDhakaDeliveryZone,
+  calculateZoneDistanceDeliveryFee,
+  calculateSplitOrderFinancials,
+  canVendorProcessPrepaidOrder,
+  summarizeRiderWalletLedger,
+  canRiderAcceptOrders,
+  summarizeDhakaZoneRiderCoverage,
 } from './marketplace-logic';
 import { DEFAULT_STOREFRONT_CONFIG, mergeStorefrontConfig } from './storefront-config';
 import { BANGLADESH_AREAS, BANGLADESH_SEARCH_PLACES, DHAKA_DELIVERY_ZONES } from './i18n';
@@ -1726,3 +1750,523 @@ test('buildMessengerUrl, buildWhatsAppSupportUrl, and StorefrontConfig defaults 
   assert.ok(supportReply.includes('Messenger'));
   assert.ok(supportReply.includes('WhatsApp'));
 });
+
+test('extractAiReplyText, coerceSafeErrorText, sanitizeAiChatHistory, and filterGeminiCandidateModels prevent white-screen crashes', () => {
+  assert.equal(extractAiReplyText('  Hello Foodora  '), 'Hello Foodora');
+  assert.equal(
+    extractAiReplyText([{ type: 'text', text: 'Part 1' }, { content: 'Part 2' }]),
+    'Part 1\nPart 2'
+  );
+  assert.equal(extractAiReplyText({ message: 'Nested message' }), 'Nested message');
+  assert.equal(extractAiReplyText(undefined), '');
+  assert.equal(extractAiReplyText(null), '');
+
+  assert.equal(coerceSafeErrorText({ error: { message: 'Quota hit' } }), 'Quota hit');
+  assert.equal(coerceSafeErrorText(new Error('[object Object]'), 'Fallback'), 'Fallback');
+  assert.equal(coerceSafeErrorText('  Bad gateway  '), 'Bad gateway');
+
+  const cleanedHistory = sanitizeAiChatHistory([
+    { role: 'user', text: '   ' },
+    { role: 'user', text: 'Hi' },
+    { role: 'assistant', text: [{ type: 'text', text: 'Hello!' }], reasoningDetails: { step: 1 } },
+    { role: 'model', text: null },
+  ]);
+  assert.equal(cleanedHistory.length, 2);
+  assert.deepEqual(cleanedHistory[0], { role: 'user', text: 'Hi' });
+  assert.deepEqual(cleanedHistory[1], {
+    role: 'model',
+    text: 'Hello!',
+    reasoning_details: { step: 1 },
+  });
+
+  const misconfiguredGeminiModels = filterGeminiCandidateModels('gpt-4o-mini');
+  assert.equal(misconfiguredGeminiModels.includes('gpt-4o-mini'), false);
+  assert.equal(misconfiguredGeminiModels[0], 'gemini-4-hydrogen');
+
+  const validGeminiModels = filterGeminiCandidateModels('gemini-3.1-flash-lite');
+  assert.equal(validGeminiModels[0], 'gemini-3.1-flash-lite');
+  assert.equal(validGeminiModels.includes('gemini-4-hydrogen'), true);
+});
+
+test('Bangladeshi delivery auto-selection prioritizes Pathao Food & supports Steadfast/RedX/Paperfly and SEO city/cuisine sitemap URLs', () => {
+  assert.ok(BANGLADESH_DELIVERY_SERVICES.some((s) => s.code === 'pathao_food'));
+  assert.ok(BANGLADESH_DELIVERY_SERVICES.some((s) => s.code === 'steadfast'));
+  assert.ok(BANGLADESH_DELIVERY_SERVICES.some((s) => s.code === 'redx'));
+
+  const pathaoDefault = selectAutoBangladeshiDeliveryService({
+    restaurantDeliveryMode: 'third_party',
+    pathaoEnabled: true,
+  });
+  assert.equal(pathaoDefault.code, 'pathao_food');
+  assert.equal(pathaoDefault.mode, 'third_party');
+
+  const steadfastFallback = selectAutoBangladeshiDeliveryService({
+    restaurantDeliveryMode: 'third_party',
+    pathaoEnabled: false,
+  });
+  assert.equal(steadfastFallback.code, 'steadfast');
+
+  const explicitRedx = selectAutoBangladeshiDeliveryService({
+    preferredServiceCode: 'redx',
+    restaurantDeliveryMode: 'platform',
+  });
+  assert.equal(explicitRedx.code, 'redx');
+  assert.equal(getBangladeshDeliveryServiceMeta('unknown').code, 'pathao_food');
+
+  const seoXml = buildSitemapXml(
+    'https://foodorabd.example',
+    [{ slug: 'sultans-dine-gulshan' }],
+    { areas: ['Gulshan 2', 'Banani'], cuisines: ['Biriyani', 'Burger'] }
+  );
+  assert.ok(seoXml.includes('?restaurant=sultans-dine-gulshan'));
+  assert.ok(seoXml.includes('?area=Gulshan%202'));
+  assert.ok(seoXml.includes('?cuisine=Biriyani'));
+});
+
+test('computeMapRouteTelemetry calculates live distance km and arrival minutes for rider and route pins', () => {
+  // Single pin without rider or secondary point returns null
+  assert.equal(
+    computeMapRouteTelemetry({ center: { lat: 23.7937, lng: 90.4066 } }),
+    null
+  );
+
+  // Restaurant -> customer route mode
+  const routeOnly = computeMapRouteTelemetry({
+    center: { lat: 23.7937, lng: 90.4066 },
+    secondaryPoint: { lat: 23.7465, lng: 90.376 },
+  });
+  assert.ok(routeOnly);
+  assert.equal(routeOnly.mode, 'route');
+  assert.ok(routeOnly.distanceKm > 4);
+  assert.ok(routeOnly.etaMinutes >= 10);
+
+  // Live rider -> active target mode
+  const liveRider = computeMapRouteTelemetry({
+    center: { lat: 23.7937, lng: 90.4066 },
+    riderPoint: { lat: 23.798, lng: 90.412 },
+    riderTarget: { lat: 23.7937, lng: 90.4066 },
+    status: 'on_the_way',
+  });
+  assert.ok(liveRider);
+  assert.equal(liveRider.mode, 'rider');
+  assert.ok(liveRider.distanceKm > 0 && liveRider.distanceKm < 2);
+  assert.ok(liveRider.etaMinutes >= 2);
+
+  // Explicit server/order ETA overrides take precedence cleanly
+  const overridden = computeMapRouteTelemetry({
+    center: { lat: 23.7937, lng: 90.4066 },
+    riderPoint: { lat: 23.798, lng: 90.412 },
+    liveDistanceKm: 1.45,
+    liveEtaMinutes: 11,
+  });
+  assert.deepEqual(overridden, {
+    distanceKm: 1.45,
+    etaMinutes: 11,
+    mode: 'rider',
+  });
+});
+
+test('summarizeTrafficCongestion classifies clear, slow, and heavy jam routes with delay minutes and Bengali/English labels', () => {
+  const heavy = summarizeTrafficCongestion({
+    distanceMeters: 4200,
+    durationSeconds: 1320, // 22 min live
+    staticDurationSeconds: 780, // 13 min free-flow
+    speedLevels: ['NORMAL', 'SLOW', 'TRAFFIC_JAM', 'NORMAL'],
+    steps: [
+      { instruction: 'Head south on Kemal Ataturk Ave', distanceMeters: 1200, durationSeconds: 300 },
+      { instruction: 'Turn left at Gulshan 1 Circle', distanceMeters: 3000, durationSeconds: 1020 },
+    ],
+    source: 'google_routes',
+  });
+
+  assert.equal(heavy.distanceKm, 4.2);
+  assert.equal(heavy.etaMinutes, 22);
+  assert.equal(heavy.staticMinutes, 13);
+  assert.equal(heavy.delayMinutes, 9);
+  assert.equal(heavy.trafficSeverity, 'heavy');
+  assert.ok(heavy.trafficLabelEn.includes('Heavy Jam'));
+  assert.ok(heavy.trafficLabelBn.includes('ভারী জ্যাম'));
+  assert.equal(heavy.speedSegments.jamCount, 1);
+  assert.equal(heavy.speedSegments.slowCount, 1);
+  assert.equal(heavy.speedSegments.normalCount, 2);
+  assert.equal(heavy.steps.length, 2);
+
+  const moderate = summarizeTrafficCongestion({
+    distanceMeters: 2500,
+    durationSeconds: 510,
+    staticDurationSeconds: 420,
+    speedLevels: ['NORMAL', 'SLOW'],
+    source: 'google_routes',
+  });
+  assert.equal(moderate.trafficSeverity, 'moderate');
+  assert.equal(moderate.delayMinutes, 2);
+  assert.ok(moderate.trafficLabelBn.includes('মাঝারি যানজট'));
+
+  const clear = summarizeTrafficCongestion({
+    distanceMeters: 1800,
+    durationSeconds: 300,
+    staticDurationSeconds: 300,
+    speedLevels: ['NORMAL'],
+    source: 'google_routes',
+  });
+  assert.equal(clear.trafficSeverity, 'clear');
+  assert.equal(clear.delayMinutes, 0);
+  assert.equal(clear.trafficLabelEn, 'Traffic Clear');
+  assert.equal(clear.trafficLabelBn, 'যানজট নেই (ফাঁকা)');
+
+  // OSRM peak hour adjustment when static == duration
+  const osrmPeak = summarizeTrafficCongestion({
+    distanceMeters: 5000,
+    durationSeconds: 900,
+    staticDurationSeconds: 900,
+    source: 'osrm',
+    peakFactorOverride: 1.4,
+  });
+  assert.equal(osrmPeak.etaMinutes, 21);
+  assert.equal(osrmPeak.delayMinutes, 6);
+  assert.equal(osrmPeak.trafficSeverity, 'heavy');
+});
+
+test('formatDirectionStepDistance, estimateDhakaPeakTrafficFactor, and buildOsrmDirectionInstruction produce clean step outputs', () => {
+  assert.equal(formatDirectionStepDistance(450, 'en'), '450 m');
+  assert.equal(formatDirectionStepDistance(450, 'bn'), '450 মি');
+  assert.equal(formatDirectionStepDistance(1500, 'en'), '1.5 km');
+  assert.equal(formatDirectionStepDistance(1500, 'bn'), '1.5 কিমি');
+
+  assert.equal(estimateDhakaPeakTrafficFactor(9), 1.38);
+  assert.equal(estimateDhakaPeakTrafficFactor(19), 1.38);
+  assert.equal(estimateDhakaPeakTrafficFactor(14), 1.2);
+  assert.equal(estimateDhakaPeakTrafficFactor(2), 1.06);
+
+  assert.equal(
+    buildOsrmDirectionInstruction({ type: 'depart', modifier: 'right', roadName: 'Road 11' }),
+    'Head right on Road 11'
+  );
+  assert.equal(
+    buildOsrmDirectionInstruction({ type: 'turn', modifier: 'left', roadName: 'Kemal Ataturk Ave' }),
+    'Turn left onto Kemal Ataturk Ave'
+  );
+  assert.equal(
+    buildOsrmDirectionInstruction({ type: 'arrive' }),
+    'Arrive at destination'
+  );
+});
+
+test('normalizeDeliveryVehicleMode and vehicle-calibrated traffic routing match Bicycle, Motorbike, Auto/CNG, and Car', () => {
+  assert.equal(normalizeDeliveryVehicleMode('Bicycle'), 'bicycle');
+  assert.equal(normalizeDeliveryVehicleMode('সাইকেল রাইডার'), 'bicycle');
+  assert.equal(normalizeDeliveryVehicleMode('Motorbike'), 'motorbike');
+  assert.equal(normalizeDeliveryVehicleMode('CNG Auto Rickshaw'), 'auto');
+  assert.equal(normalizeDeliveryVehicleMode('অটো / সিএনজি'), 'auto');
+  assert.equal(normalizeDeliveryVehicleMode('Sedan Car'), 'car');
+  assert.equal(normalizeDeliveryVehicleMode('Walking Courier'), 'walking');
+  assert.equal(normalizeDeliveryVehicleMode(undefined), 'motorbike');
+
+  assert.equal(getDeliveryVehicleMeta('bicycle').googleTravelMode, 'BICYCLING');
+  assert.equal(getDeliveryVehicleMeta('bicycle').labelBn, 'সাইকেল');
+  assert.equal(getDeliveryVehicleMeta('auto').labelBn, 'অটো / সিএনজি');
+  assert.equal(getDeliveryVehicleMeta('car').labelBn, 'গাড়ি');
+
+  // Same 5km route under Dhaka jam: bicycle stays at ~14.5km/h (~21-24m), motorbike filters jam faster than car
+  const bikeRoute = summarizeTrafficCongestion({
+    distanceMeters: 5000,
+    durationSeconds: 1200, // 20m car jam
+    staticDurationSeconds: 600, // 10m car free-flow (highway)
+    speedLevels: ['NORMAL', 'TRAFFIC_JAM'],
+    source: 'google_routes',
+    vehicleMode: 'bicycle',
+    routeMatchesVehicle: false, // driving fallback path used for street jam visualization
+  });
+  const motoRoute = summarizeTrafficCongestion({
+    distanceMeters: 5000,
+    durationSeconds: 1200,
+    staticDurationSeconds: 600,
+    speedLevels: ['NORMAL', 'TRAFFIC_JAM'],
+    source: 'google_routes',
+    vehicleMode: 'motorbike',
+  });
+  const carRoute = summarizeTrafficCongestion({
+    distanceMeters: 5000,
+    durationSeconds: 1200,
+    staticDurationSeconds: 600,
+    speedLevels: ['NORMAL', 'TRAFFIC_JAM'],
+    source: 'google_routes',
+    vehicleMode: 'car',
+  });
+  const autoRoute = summarizeTrafficCongestion({
+    distanceMeters: 5000,
+    durationSeconds: 1200,
+    staticDurationSeconds: 600,
+    speedLevels: ['NORMAL', 'TRAFFIC_JAM'],
+    source: 'google_routes',
+    vehicleMode: 'auto',
+  });
+
+  assert.equal(bikeRoute.vehicleMode, 'bicycle');
+  assert.ok(bikeRoute.etaMinutes >= 20); // Never unrealistically fast 10m highway car ETA
+  assert.ok(motoRoute.etaMinutes < carRoute.etaMinutes); // Two-wheeler filters Dhaka jam faster than Car
+  assert.ok(autoRoute.etaMinutes >= carRoute.etaMinutes); // Auto/CNG slower than open Car
+});
+
+test('formatDurationEstimate converts 60+ minutes into clean hours+minutes in English and Bengali', () => {
+  assert.equal(formatDurationEstimate(0, 'en'), '0 mins');
+  assert.equal(formatDurationEstimate(0, 'en', 'compact'), '0 min');
+  assert.equal(formatDurationEstimate(0, 'bn'), '০ মিনিট');
+  assert.equal(formatDurationEstimate(1, 'en'), '1 min');
+  assert.equal(formatDurationEstimate(28, 'en'), '28 mins');
+  assert.equal(formatDurationEstimate(28, 'en', 'compact'), '28 min');
+  assert.equal(formatDurationEstimate(28, 'bn'), '২৮ মিনিট');
+  assert.equal(formatDurationEstimate(60, 'en'), '1 hr');
+  assert.equal(formatDurationEstimate(60, 'bn'), '১ ঘণ্টা');
+  assert.equal(formatDurationEstimate(417, 'en'), '6 hr 57 min');
+  assert.equal(formatDurationEstimate(417, 'bn'), '৬ ঘণ্টা ৫৭ মিনিট');
+  assert.equal(formatDurationEstimate(125, 'en'), '2 hr 5 min');
+  assert.equal(formatDurationEstimate(125, 'bn'), '২ ঘণ্টা ৫ মিনিট');
+  assert.equal(formatDurationEstimate(1440, 'en'), '1d');
+  assert.equal(formatDurationEstimate(1440, 'bn'), '১ দিন');
+  assert.equal(formatDurationEstimate(1500, 'en'), '1d 1 hr');
+  assert.equal(formatDurationEstimate(1500, 'bn'), '১ দিন ১ ঘণ্টা');
+  assert.equal(formatDurationEstimate(1525, 'en', 'default'), '1d 1 hr 25 min');
+  assert.equal(formatDurationEstimate(1525, 'en', 'compact'), '1d 1 hr');
+});
+
+test('summarizeTrafficCongestion and email payload format multi-hour ETAs and delays using hours+minutes', () => {
+  const interCityJam = summarizeTrafficCongestion({
+    distanceMeters: 245000,
+    durationSeconds: 417 * 60,
+    staticDurationSeconds: 322 * 60,
+    speedLevels: [],
+    source: 'google_routes',
+    vehicleMode: 'car',
+  });
+  assert.equal(interCityJam.delayMinutes, 95);
+  assert.ok(interCityJam.trafficLabelEn.includes('1 hr 35 min delay'));
+  assert.ok(interCityJam.trafficLabelBn.includes('১ ঘণ্টা ৩৫ মিনিট দেরি'));
+
+  const emailPayload = buildOrderTrackingEmailPayload({
+    origin: 'https://foodorabd.com',
+    orderId: 501,
+    orderNumber: 'FD-501',
+    trackingToken: 'tok-501',
+    status: 'on_the_way',
+    customerName: 'Nadia Islam',
+    customerEmail: 'nadia@example.com',
+    restaurantName: 'Sultan Dine',
+    deliveryArea: 'Chattogram',
+    totalAmount: 950,
+    paymentMethod: 'cod',
+    etaMinutes: 417,
+  });
+  assert.ok(emailPayload.html.includes('~6 hr 57 min'));
+  assert.ok(emailPayload.text.includes('~6 hr 57 min'));
+
+  const bikeTelemetry = computeMapRouteTelemetry({
+    center: { lat: 23.7336, lng: 90.3847 },
+    secondaryPoint: { lat: 23.7949, lng: 90.4144 },
+    vehicleMode: 'bicycle',
+  });
+  const motoTelemetry = computeMapRouteTelemetry({
+    center: { lat: 23.7336, lng: 90.3847 },
+    secondaryPoint: { lat: 23.7949, lng: 90.4144 },
+    vehicleMode: 'motorbike',
+  });
+  assert.ok(bikeTelemetry && motoTelemetry);
+  assert.ok(bikeTelemetry.etaMinutes > motoTelemetry.etaMinutes);
+});
+
+test('calculateSplitOrderFinancials splits food payment online and delivery charge cash to rider (500 + 60 -> 45/15)', () => {
+  const split = calculateSplitOrderFinancials({
+    subtotal: 500,
+    discountAmount: 0,
+    deliveryFee: 60,
+    serviceFee: 0,
+    taxAmount: 0,
+    commissionType: 'percentage',
+    commissionRate: 15,
+    fixedCommission: 0,
+    paymentMethod: 'bkash',
+    riderEarningRule: { mode: 'percentage', value: 75 },
+  });
+
+  assert.equal(split.paymentSplitMode, 'online_food_cash_delivery');
+  assert.equal(split.onlineFoodPayable, 500);
+  assert.equal(split.cashDueToRider, 60);
+  assert.equal(split.customerTotalCost, 560);
+  assert.equal(split.riderEarningAmount, 45);
+  assert.equal(split.foodoraDeliveryCommission, 15);
+  assert.equal(split.platformCommission, 75);
+  assert.equal(split.restaurantEarnings, 425);
+
+  // Free delivery coupon leaves 0 cash due to rider & 0 rider/commission split
+  const freeDel = calculateSplitOrderFinancials({
+    subtotal: 500,
+    discountAmount: 0,
+    deliveryFee: 0,
+    serviceFee: 10,
+    taxAmount: 0,
+    commissionType: 'percentage',
+    commissionRate: 15,
+    fixedCommission: 0,
+    paymentMethod: 'nagad',
+    riderEarningRule: { mode: 'fixed', value: 45 },
+  });
+  assert.equal(freeDel.onlineFoodPayable, 510);
+  assert.equal(freeDel.cashDueToRider, 0);
+  assert.equal(freeDel.riderEarningAmount, 0);
+  assert.equal(freeDel.foodoraDeliveryCommission, 0);
+
+  // resolveRiderCashCollectAmount collects ONLY delivery charge for split orders
+  const riderCollect = resolveRiderCashCollectAmount('bkash', 560, null, {
+    paymentSplitMode: 'online_food_cash_delivery',
+    cashDueToRider: 60,
+  });
+  assert.equal(riderCollect.isCod, true);
+  assert.equal(riderCollect.isDeliveryCashOnly, true);
+  assert.equal(riderCollect.amountToCollect, 60);
+});
+
+test('calculateZoneDistanceDeliveryFee applies Admin Dhaka zone rates and distance pricing rules', () => {
+  const cfg = mergeDeliveryFinancialConfig({
+    zoneFees: { 'ZONE 01': 55, 'ZONE 05': 75 },
+    distancePricing: { enabled: true, baseDistanceKm: 3, baseFee: 60, perKmFee: 12, minFee: 40, maxFee: 180 },
+  });
+  const gulshanShort = calculateZoneDistanceDeliveryFee({
+    area: 'Gulshan 2',
+    distanceKm: 2.1,
+    config: cfg,
+  });
+  assert.equal(gulshanShort.zoneCode, 'ZONE 01');
+  assert.equal(gulshanShort.deliveryFee, 55);
+
+  const uttaraFar = calculateZoneDistanceDeliveryFee({
+    area: 'Uttara Sector 7',
+    distanceKm: 6,
+    config: cfg,
+  });
+  assert.equal(uttaraFar.zoneCode, 'ZONE 05');
+  assert.equal(uttaraFar.deliveryFee, 75 + 3 * 12);
+});
+
+test('canVendorProcessPrepaidOrder locks restaurant processing until online food payment is paid', () => {
+  const pendingBkash = canVendorProcessPrepaidOrder({
+    paymentMethod: 'bkash',
+    paymentStatus: 'pending',
+    nextStatus: 'accepted',
+  });
+  assert.equal(pendingBkash.allowed, false);
+
+  const cancelPending = canVendorProcessPrepaidOrder({
+    paymentMethod: 'bkash',
+    paymentStatus: 'pending',
+    nextStatus: 'cancelled',
+  });
+  assert.equal(cancelPending.allowed, true);
+
+  const paidBkash = canVendorProcessPrepaidOrder({
+    paymentMethod: 'bkash',
+    paymentStatus: 'paid',
+    nextStatus: 'accepted',
+  });
+  assert.equal(paidBkash.allowed, true);
+});
+
+test('summarizeRiderWalletLedger, canRiderAcceptOrders, and summarizeDhakaZoneRiderCoverage enforce approvals and 12-zone matrix', () => {
+  const summary = summarizeRiderWalletLedger([
+    {
+      entryType: 'delivery_earning',
+      cashCollected: 60,
+      riderEarningDelta: 45,
+      commissionOwedDelta: 0,
+      commissionSettledDelta: 0,
+    },
+    {
+      entryType: 'commission_owed',
+      cashCollected: 0,
+      riderEarningDelta: 0,
+      commissionOwedDelta: 15,
+      commissionSettledDelta: 0,
+    },
+    {
+      entryType: 'commission_settled',
+      cashCollected: 0,
+      riderEarningDelta: 0,
+      commissionOwedDelta: 0,
+      commissionSettledDelta: 10,
+    },
+  ]);
+  assert.equal(summary.totalCashCollected, 60);
+  assert.equal(summary.totalRiderEarnings, 45);
+  assert.equal(summary.totalCommissionOwed, 15);
+  assert.equal(summary.totalCommissionSettled, 10);
+  assert.equal(summary.outstandingCommission, 5);
+  assert.equal(summary.deliveredCountFromLedger, 1);
+
+  assert.equal(
+    canRiderAcceptOrders({ riderStatus: 'pending', outstandingCommission: 0 }).allowed,
+    false
+  );
+  assert.equal(
+    canRiderAcceptOrders({
+      riderStatus: 'approved',
+      outstandingCommission: 600,
+      settlementRules: {
+        ...DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules,
+        maxOutstandingLimit: 500,
+        autoBlockDispatchAboveLimit: true,
+      },
+    }).allowed,
+    false
+  );
+  assert.equal(
+    canRiderAcceptOrders({
+      riderStatus: 'approved',
+      outstandingCommission: 15,
+      settlementRules: DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules,
+    }).allowed,
+    true
+  );
+
+  const coverage = summarizeDhakaZoneRiderCoverage([
+    { zone: 'ZONE 01 — GULSHAN', status: 'approved', isAvailable: true },
+    { zone: 'Mirpur 10', status: 'pending', isAvailable: false },
+    { zone: 'Dhanmondi 27', status: 'approved', isAvailable: false },
+  ]);
+  assert.equal(coverage.length, 12);
+  const z1 = coverage.find((z) => z.zoneCode === 'ZONE 01');
+  const z3 = coverage.find((z) => z.zoneCode === 'ZONE 03');
+  const z4 = coverage.find((z) => z.zoneCode === 'ZONE 04');
+  assert.equal(z1?.onlineCount, 1);
+  assert.equal(z1?.hasActiveCoverage, true);
+  assert.equal(z3?.approvedCount, 1);
+  assert.equal(z3?.onlineCount, 0);
+  assert.equal(z4?.pendingCount, 1);
+  assert.equal(z4?.hasActiveCoverage, false);
+
+  const emailSplit = buildOrderTrackingEmailPayload({
+    origin: 'https://foodorabd.com',
+    orderId: 777,
+    orderNumber: 'FD-777',
+    status: 'confirmed',
+    customerName: 'Amina',
+    customerEmail: 'amina@example.com',
+    restaurantName: 'Kacchi Bhai',
+    deliveryArea: 'Gulshan 2',
+    subtotal: 500,
+    deliveryFee: 60,
+    serviceFee: 0,
+    totalAmount: 560,
+    paymentMethod: 'bkash',
+    paymentStatus: 'paid',
+    paymentSplitMode: 'online_food_cash_delivery',
+    onlineFoodPaidAmount: 500,
+    cashDueToRider: 60,
+    items: [{ name: 'Chicken Biryani', quantity: 1, lineTotal: 500 }],
+  });
+  assert.ok(emailSplit.html.includes('Online Food Payment'));
+  assert.ok(emailSplit.html.includes('Pay Cash to Rider (Delivery Charge)'));
+  assert.ok(emailSplit.text.includes('Cash to Rider (Delivery Charge): BDT 60'));
+});
+
+
+
+

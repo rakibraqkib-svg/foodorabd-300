@@ -38,12 +38,14 @@ __export(schema_exports, {
   orders: () => orders,
   partnerApiKeys: () => partnerApiKeys,
   paymentGateways: () => paymentGateways,
+  paymentTransactions: () => paymentTransactions,
   platformSettings: () => platformSettings,
   restaurantPayouts: () => restaurantPayouts,
   restaurants: () => restaurants,
   reviews: () => reviews,
   riderJobApplications: () => riderJobApplications,
   riderJobs: () => riderJobs,
+  riderWalletLedger: () => riderWalletLedger,
   riders: () => riders,
   users: () => users,
   vendorAdminMessages: () => vendorAdminMessages
@@ -242,6 +244,15 @@ var orders = pgTable("orders", {
   riderUid: text("rider_uid").default(""),
   riderName: text("rider_name").default(""),
   estimatedMinutes: integer("estimated_minutes").notNull().default(30),
+  paymentSplitMode: text("payment_split_mode").notNull().default("online_food_cash_delivery"),
+  onlineFoodPaidAmount: integer("online_food_paid_amount").notNull().default(0),
+  cashDueToRider: integer("cash_due_to_rider").notNull().default(0),
+  riderEarningAmount: integer("rider_earning_amount").notNull().default(0),
+  foodoraDeliveryCommission: integer("foodora_delivery_commission").notNull().default(0),
+  cashCollectionStatus: text("cash_collection_status").notNull().default("pending"),
+  // pending | collected | reversed
+  cashCollectedAmount: integer("cash_collected_amount").notNull().default(0),
+  cashCollectedAt: timestamp("cash_collected_at"),
   itemsSnapshotJson: jsonb("items_snapshot_json").$type().notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull()
@@ -356,6 +367,7 @@ var platformSettings = pgTable("platform_settings", {
   sslcommerzEnabled: boolean("sslcommerz_enabled").notNull().default(true),
   sslcommerzSandbox: boolean("sslcommerz_sandbox").notNull().default(true),
   storefrontConfig: jsonb("storefront_config").$type().notNull().default({}),
+  deliveryFinancialConfig: jsonb("delivery_financial_config").$type().notNull().default({}),
   updatedAt: timestamp("updated_at").defaultNow().notNull()
 });
 var auditLogs = pgTable("audit_logs", {
@@ -430,6 +442,43 @@ var aiProviders = pgTable("ai_providers", {
   sortOrder: integer("sort_order").notNull().default(10),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull()
+});
+var paymentTransactions = pgTable("payment_transactions", {
+  id: serial("id").primaryKey(),
+  orderId: integer("order_id").references(() => orders.id, { onDelete: "cascade" }).notNull(),
+  orderNumber: text("order_number").notNull(),
+  txKind: text("tx_kind").notNull(),
+  // food_payment | delivery_cash | food_refund | delivery_reversal | rider_commission_settlement
+  idempotencyKey: text("idempotency_key").notNull().unique(),
+  payerRole: text("payer_role").notNull().default("customer"),
+  // customer | rider | platform
+  recipientRole: text("recipient_role").notNull().default("platform_restaurant"),
+  // platform_restaurant | rider | foodora | customer
+  paymentMethod: text("payment_method").notNull().default("bkash"),
+  amount: integer("amount").notNull().default(0),
+  status: text("status").notNull().default("pending"),
+  // pending | succeeded | failed | refunded | cancelled
+  gatewayTxId: text("gateway_tx_id").default(""),
+  riderUid: text("rider_uid").default(""),
+  note: text("note").default(""),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull()
+});
+var riderWalletLedger = pgTable("rider_wallet_ledger", {
+  id: serial("id").primaryKey(),
+  riderUid: text("rider_uid").notNull(),
+  orderId: integer("order_id").references(() => orders.id, { onDelete: "set null" }),
+  orderNumber: text("order_number").notNull().default(""),
+  entryType: text("entry_type").notNull(),
+  // delivery_earning | commission_owed | commission_settled | commission_reversal
+  idempotencyKey: text("idempotency_key").notNull().unique(),
+  cashCollected: integer("cash_collected").notNull().default(0),
+  riderEarningDelta: integer("rider_earning_delta").notNull().default(0),
+  commissionOwedDelta: integer("commission_owed_delta").notNull().default(0),
+  commissionSettledDelta: integer("commission_settled_delta").notNull().default(0),
+  referenceId: text("reference_id").default(""),
+  note: text("note").default(""),
+  createdAt: timestamp("created_at").defaultNow().notNull()
 });
 
 // src/db/index.ts
@@ -548,7 +597,9 @@ var EXPECTED_TABLES = [
   "rider_jobs",
   "rider_job_applications",
   "vendor_admin_messages",
-  "ai_providers"
+  "ai_providers",
+  "payment_transactions",
+  "rider_wallet_ledger"
 ];
 async function runCreateTablesIfMissing() {
   const existingRes = await db.execute(sql`
@@ -576,7 +627,21 @@ async function runCreateTablesIfMissing() {
       await db.execute(sql`
         ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS customer_email TEXT NOT NULL DEFAULT '',
-        ADD COLUMN IF NOT EXISTS tracking_token TEXT NOT NULL DEFAULT '';
+        ADD COLUMN IF NOT EXISTS tracking_token TEXT NOT NULL DEFAULT '',
+        ADD COLUMN IF NOT EXISTS payment_split_mode TEXT NOT NULL DEFAULT 'online_food_cash_delivery',
+        ADD COLUMN IF NOT EXISTS online_food_paid_amount INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_due_to_rider INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS rider_earning_amount INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS foodora_delivery_commission INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_collection_status TEXT NOT NULL DEFAULT 'pending',
+        ADD COLUMN IF NOT EXISTS cash_collected_amount INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_collected_at TIMESTAMP;
+      `);
+    }
+    if (existingSet.has("platform_settings")) {
+      await db.execute(sql`
+        ALTER TABLE platform_settings
+        ADD COLUMN IF NOT EXISTS delivery_financial_config JSONB NOT NULL DEFAULT '{}'::jsonb;
       `);
     }
     if (existingSet.has("riders")) {
@@ -800,6 +865,14 @@ async function createMissingTables(existingSet) {
         rider_uid TEXT DEFAULT '',
         rider_name TEXT DEFAULT '',
         estimated_minutes INTEGER NOT NULL DEFAULT 30,
+        payment_split_mode TEXT NOT NULL DEFAULT 'online_food_cash_delivery',
+        online_food_paid_amount INTEGER NOT NULL DEFAULT 0,
+        cash_due_to_rider INTEGER NOT NULL DEFAULT 0,
+        rider_earning_amount INTEGER NOT NULL DEFAULT 0,
+        foodora_delivery_commission INTEGER NOT NULL DEFAULT 0,
+        cash_collection_status TEXT NOT NULL DEFAULT 'pending',
+        cash_collected_amount INTEGER NOT NULL DEFAULT 0,
+        cash_collected_at TIMESTAMP,
         items_snapshot_json JSONB NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -947,6 +1020,7 @@ async function createMissingTables(existingSet) {
         sslcommerz_enabled BOOLEAN NOT NULL DEFAULT TRUE,
         sslcommerz_sandbox BOOLEAN NOT NULL DEFAULT TRUE,
         storefront_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+        delivery_financial_config JSONB NOT NULL DEFAULT '{}'::jsonb,
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
     `);
@@ -1037,6 +1111,46 @@ async function createMissingTables(existingSet) {
         sort_order INTEGER NOT NULL DEFAULT 10,
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+    `);
+  }
+  if (!existingSet.has("payment_transactions")) {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        order_number TEXT NOT NULL,
+        tx_kind TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        payer_role TEXT NOT NULL DEFAULT 'customer',
+        recipient_role TEXT NOT NULL DEFAULT 'platform_restaurant',
+        payment_method TEXT NOT NULL DEFAULT 'bkash',
+        amount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        gateway_tx_id TEXT DEFAULT '',
+        rider_uid TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+    `);
+  }
+  if (!existingSet.has("rider_wallet_ledger")) {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS rider_wallet_ledger (
+        id SERIAL PRIMARY KEY,
+        rider_uid TEXT NOT NULL,
+        order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+        order_number TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        cash_collected INTEGER NOT NULL DEFAULT 0,
+        rider_earning_delta INTEGER NOT NULL DEFAULT 0,
+        commission_owed_delta INTEGER NOT NULL DEFAULT 0,
+        commission_settled_delta INTEGER NOT NULL DEFAULT 0,
+        reference_id TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
     `);
   }
@@ -2116,6 +2230,47 @@ async function runSeedIfEmpty() {
 import { and, asc, desc, eq, inArray, like, or } from "drizzle-orm";
 
 // src/lib/marketplace-logic.ts
+function toBengaliDigits(input) {
+  const bnDigits = ["\u09E6", "\u09E7", "\u09E8", "\u09E9", "\u09EA", "\u09EB", "\u09EC", "\u09ED", "\u09EE", "\u09EF"];
+  return String(input).replace(/\d/g, (d) => bnDigits[Number(d)] ?? d);
+}
+function formatDurationEstimate(minutes, lang = "en", style = "default") {
+  const safeMins = Number.isFinite(minutes) ? Math.max(0, Math.round(minutes)) : 0;
+  const formatNum = (val) => lang === "bn" ? toBengaliDigits(val) : String(val);
+  if (safeMins === 0) {
+    return lang === "bn" ? "\u09E6 \u09AE\u09BF\u09A8\u09BF\u099F" : style === "compact" ? "0 min" : "0 mins";
+  }
+  if (safeMins < 60) {
+    if (lang === "bn") {
+      return `${formatNum(safeMins)} \u09AE\u09BF\u09A8\u09BF\u099F`;
+    }
+    return style === "compact" || safeMins === 1 ? `${safeMins} min` : `${safeMins} mins`;
+  }
+  const days = Math.floor(safeMins / 1440);
+  const remAfterDays = safeMins % 1440;
+  const hours = Math.floor(remAfterDays / 60);
+  const mins = remAfterDays % 60;
+  if (days > 0) {
+    const partsEn2 = [`${days}d`];
+    const partsBn2 = [`${formatNum(days)} \u09A6\u09BF\u09A8`];
+    if (hours > 0) {
+      partsEn2.push(`${hours} hr`);
+      partsBn2.push(`${formatNum(hours)} \u0998\u09A3\u09CD\u099F\u09BE`);
+    }
+    if (mins > 0 && style !== "compact") {
+      partsEn2.push(`${mins} min`);
+      partsBn2.push(`${formatNum(mins)} \u09AE\u09BF\u09A8\u09BF\u099F`);
+    }
+    return lang === "bn" ? partsBn2.join(" ") : partsEn2.join(" ");
+  }
+  const partsEn = [`${hours} hr`];
+  const partsBn = [`${formatNum(hours)} \u0998\u09A3\u09CD\u099F\u09BE`];
+  if (mins > 0) {
+    partsEn.push(`${mins} min`);
+    partsBn.push(`${formatNum(mins)} \u09AE\u09BF\u09A8\u09BF\u099F`);
+  }
+  return lang === "bn" ? partsBn.join(" ") : partsEn.join(" ");
+}
 function calculateCartItemUnitPrice(item) {
   const effectiveBase = item.discountPrice !== null && item.discountPrice !== void 0 && item.discountPrice > 0 ? item.discountPrice : item.basePrice;
   const variationCost = item.variationDelta ?? 0;
@@ -2489,7 +2644,7 @@ function buildRobotsTxt(origin) {
     ""
   ].join("\n");
 }
-function buildSitemapXml(origin, restaurants2) {
+function buildSitemapXml(origin, restaurants2, options) {
   const cleanOrigin = origin.replace(/\/+$/, "");
   const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
   const urls = [
@@ -2516,7 +2671,27 @@ function buildSitemapXml(origin, restaurants2) {
       loc: `${cleanOrigin}/?restaurant=${encodeURIComponent(slug)}`,
       lastmod,
       changefreq: "daily",
+      priority: "0.9"
+    });
+  }
+  for (const area of options?.areas || []) {
+    const clean = String(area || "").trim();
+    if (!clean) continue;
+    urls.push({
+      loc: `${cleanOrigin}/?area=${encodeURIComponent(clean)}`,
+      lastmod: today,
+      changefreq: "weekly",
       priority: "0.8"
+    });
+  }
+  for (const cuisine of options?.cuisines || []) {
+    const clean = String(cuisine || "").trim();
+    if (!clean) continue;
+    urls.push({
+      loc: `${cleanOrigin}/?cuisine=${encodeURIComponent(clean)}`,
+      lastmod: today,
+      changefreq: "weekly",
+      priority: "0.7"
     });
   }
   const urlNodes = urls.map(
@@ -2882,7 +3057,7 @@ function buildOrderTrackingEmailPayload(input) {
   };
   const subject = `Foodora BD \xB7 ${info.en} (${input.orderNumber} / ${invoiceNumber})`;
   const riderLine = input.riderName ? `<p style="margin:4px 0;"><strong>Assigned Rider:</strong> ${escapeXml(input.riderName)}${input.riderPhone ? ` (${escapeXml(input.riderPhone)})` : ""}</p>` : "";
-  const etaLine = typeof input.etaMinutes === "number" && input.etaMinutes > 0 && input.status !== "delivered" && input.status !== "cancelled" ? `<p style="margin:4px 0;"><strong>Estimated Arrival:</strong> ~${input.etaMinutes} mins</p>` : "";
+  const etaLine = typeof input.etaMinutes === "number" && input.etaMinutes > 0 && input.status !== "delivered" && input.status !== "cancelled" ? `<p style="margin:4px 0;"><strong>Estimated Arrival:</strong> ~${formatDurationEstimate(input.etaMinutes, "en")}</p>` : "";
   const addressLine = input.deliveryAddress ? `<p style="margin:4px 0;"><strong>Delivery Address:</strong> ${escapeXml(input.deliveryAddress)}</p>` : "";
   const noteLine = input.statusNote ? `<p style="margin:4px 0;"><strong>Update:</strong> ${escapeXml(input.statusNote)}</p>` : "";
   const paymentBadge = input.paymentStatus ? ` \xB7 ${escapeXml(input.paymentStatus.toUpperCase())}` : "";
@@ -2893,6 +3068,9 @@ function buildOrderTrackingEmailPayload(input) {
   const deliveryFeeVal = Math.max(0, Number(input.deliveryFee ?? 0));
   const serviceFeeVal = Math.max(0, Number(input.serviceFee ?? 0));
   const taxVal = Math.max(0, Number(input.taxAmount ?? 0));
+  const isSplitOrder = input.paymentSplitMode === "online_food_cash_delivery" || typeof input.onlineFoodPaidAmount === "number" && typeof input.cashDueToRider === "number";
+  const onlineFoodPart = typeof input.onlineFoodPaidAmount === "number" ? Math.max(0, Math.round(input.onlineFoodPaidAmount)) : Math.max(0, Math.round(input.totalAmount - deliveryFeeVal));
+  const cashRiderPart = typeof input.cashDueToRider === "number" ? Math.max(0, Math.round(input.cashDueToRider)) : deliveryFeeVal;
   const itemsBlock = itemsList.length > 0 ? `<div style="border-top:1px solid #F3F4F6;padding-top:10px;margin-top:10px;">
            <p style="margin:0 0 8px;font-size:12px;font-weight:bold;color:#2E3138;">Itemized Invoice (${escapeXml(invoiceNumber)}):</p>
            <table style="width:100%;border-collapse:collapse;font-size:12px;color:#374151;">
@@ -2933,10 +3111,12 @@ function buildOrderTrackingEmailPayload(input) {
            <div style="border-top:1px solid #FBCFE8;margin-top:8px;padding-top:8px;font-size:12px;color:#374151;">
              <p style="margin:2px 0;"><span>Subtotal:</span> <strong style="float:right;">\u09F3${computedSubtotal}</strong></p>
              ${discountVal > 0 ? `<p style="margin:2px 0;color:#059669;"><span>Discount${input.couponCode ? ` (${escapeXml(input.couponCode)})` : ""}:</span> <strong style="float:right;">-\u09F3${discountVal}</strong></p>` : ""}
-             ${typeof input.deliveryFee === "number" ? `<p style="margin:2px 0;"><span>Delivery Fee:</span> <strong style="float:right;">\u09F3${deliveryFeeVal}</strong></p>` : ""}
+             ${typeof input.deliveryFee === "number" ? `<p style="margin:2px 0;"><span>Delivery Fee${isSplitOrder ? " (Cash to Rider)" : ""}:</span> <strong style="float:right;">\u09F3${deliveryFeeVal}</strong></p>` : ""}
              ${typeof input.serviceFee === "number" ? `<p style="margin:2px 0;"><span>Service Fee:</span> <strong style="float:right;">\u09F3${serviceFeeVal}</strong></p>` : ""}
              ${taxVal > 0 ? `<p style="margin:2px 0;"><span>VAT / Tax:</span> <strong style="float:right;">\u09F3${taxVal}</strong></p>` : ""}
-             <p style="margin:6px 0 0;padding-top:6px;border-top:1px dashed #FBCFE8;font-size:13px;color:#E21B70;"><span><strong>Total Payable:</strong></span> <strong style="float:right;">\u09F3${input.totalAmount}</strong></p>
+             ${isSplitOrder ? `<p style="margin:4px 0;color:#059669;"><span>Online Food Payment (${escapeXml(input.paymentMethod.toUpperCase())}):</span> <strong style="float:right;">\u09F3${onlineFoodPart}</strong></p>
+                    <p style="margin:4px 0;color:#B45309;"><span>Pay Cash to Rider (Delivery Charge):</span> <strong style="float:right;">\u09F3${cashRiderPart}</strong></p>` : ""}
+             <p style="margin:6px 0 0;padding-top:6px;border-top:1px dashed #FBCFE8;font-size:13px;color:#E21B70;"><span><strong>${isSplitOrder ? "Customer Total Cost:" : "Total Payable:"}</strong></span> <strong style="float:right;">\u09F3${input.totalAmount}</strong></p>
            </div>
          </div>` : "";
   const steps = [
@@ -2975,6 +3155,7 @@ function buildOrderTrackingEmailPayload(input) {
           <p style="margin:4px 0;"><strong>Delivery Area:</strong> ${escapeXml(input.deliveryArea)}</p>
           ${addressLine}
           <p style="margin:4px 0;"><strong>Payment:</strong> ${escapeXml(input.paymentMethod.toUpperCase())}${paymentBadge} \xB7 <strong>Total: \u09F3${input.totalAmount}</strong></p>
+          ${isSplitOrder ? `<p style="margin:4px 0;color:#059669;"><strong>Online Food Payment:</strong> \u09F3${onlineFoodPart} \xB7 <strong style="color:#B45309;">Cash to Rider (Delivery):</strong> \u09F3${cashRiderPart}</p>` : ""}
           ${etaLine}
           ${riderLine}
           ${noteLine}
@@ -2994,14 +3175,17 @@ Subtotal: BDT ${computedSubtotal}${discountVal > 0 ? `
 Discount: -BDT ${discountVal}` : ""}${typeof input.deliveryFee === "number" ? `
 Delivery Fee: BDT ${deliveryFeeVal}` : ""}${typeof input.serviceFee === "number" ? `
 Service Fee: BDT ${serviceFeeVal}` : ""}` : "";
+  const splitSummaryText = isSplitOrder ? `
+Online Food Payment: BDT ${onlineFoodPart}
+Cash to Rider (Delivery Charge): BDT ${cashRiderPart}` : "";
   const text2 = `Foodora BD \u2014 Invoice ${invoiceNumber} | Order ${input.orderNumber} (${info.en} / ${info.bn})
 ${info.subEn}
 ${info.subBn}
 Restaurant: ${input.restaurantName}
 Delivery Area: ${input.deliveryArea}${input.deliveryAddress ? `
-Address: ${input.deliveryAddress}` : ""}${itemsText}
+Address: ${input.deliveryAddress}` : ""}${itemsText}${splitSummaryText}
 Total: BDT ${input.totalAmount} (${input.paymentMethod.toUpperCase()}${input.paymentStatus ? ` \xB7 ${input.paymentStatus}` : ""})
-${input.etaMinutes ? `Estimated Arrival: ~${input.etaMinutes} mins
+${input.etaMinutes ? `Estimated Arrival: ~${formatDurationEstimate(input.etaMinutes, "en")}
 ` : ""}${input.riderName ? `Rider: ${input.riderName}${input.riderPhone ? ` (${input.riderPhone})` : ""}
 ` : ""}${input.statusNote ? `Update: ${input.statusNote}
 ` : ""}Track live on map: ${trackingUrl}`;
@@ -3371,12 +3555,73 @@ function mergeAddressSuggestions(localItems, remoteItems, limit = 12) {
 }
 function resolveAiEnvFlags(flagOrBool) {
   if (typeof flagOrBool === "boolean") {
-    return { hasGeminiKey: flagOrBool, hasOpenRouterKey: false };
+    return {
+      hasGeminiKey: flagOrBool,
+      hasOpenRouterKey: false,
+      hasOpenAIKey: false,
+      hasGroqKey: false,
+      hasDeepSeekKey: false,
+      hasAnthropicKey: false,
+      hasMistralKey: false,
+      hasXaiKey: false,
+      hasTogetherKey: false,
+      hasCerebrasKey: false,
+      hasPerplexityKey: false,
+      hasCohereKey: false,
+      hasHuggingFaceKey: false
+    };
   }
   return {
     hasGeminiKey: Boolean(flagOrBool?.hasGeminiKey),
-    hasOpenRouterKey: Boolean(flagOrBool?.hasOpenRouterKey)
+    hasOpenRouterKey: Boolean(flagOrBool?.hasOpenRouterKey),
+    hasOpenAIKey: Boolean(flagOrBool?.hasOpenAIKey),
+    hasGroqKey: Boolean(flagOrBool?.hasGroqKey),
+    hasDeepSeekKey: Boolean(flagOrBool?.hasDeepSeekKey),
+    hasAnthropicKey: Boolean(flagOrBool?.hasAnthropicKey),
+    hasMistralKey: Boolean(flagOrBool?.hasMistralKey),
+    hasXaiKey: Boolean(flagOrBool?.hasXaiKey),
+    hasTogetherKey: Boolean(flagOrBool?.hasTogetherKey),
+    hasCerebrasKey: Boolean(flagOrBool?.hasCerebrasKey),
+    hasPerplexityKey: Boolean(flagOrBool?.hasPerplexityKey),
+    hasCohereKey: Boolean(flagOrBool?.hasCohereKey),
+    hasHuggingFaceKey: Boolean(flagOrBool?.hasHuggingFaceKey)
   };
+}
+function hasEnvKeyForAiProviderType(providerType, envFlags = false) {
+  const flags = resolveAiEnvFlags(envFlags);
+  switch (providerType) {
+    case "foodora":
+    case "pollinations":
+      return true;
+    case "gemini":
+      return flags.hasGeminiKey;
+    case "openrouter":
+      return flags.hasOpenRouterKey;
+    case "openai":
+      return flags.hasOpenAIKey;
+    case "groq":
+      return flags.hasGroqKey;
+    case "deepseek":
+      return flags.hasDeepSeekKey;
+    case "anthropic":
+      return flags.hasAnthropicKey;
+    case "mistral":
+      return flags.hasMistralKey;
+    case "xai":
+      return flags.hasXaiKey;
+    case "together":
+      return flags.hasTogetherKey;
+    case "cerebras":
+      return flags.hasCerebrasKey;
+    case "perplexity":
+      return flags.hasPerplexityKey;
+    case "cohere":
+      return flags.hasCohereKey;
+    case "huggingface":
+      return flags.hasHuggingFaceKey;
+    default:
+      return false;
+  }
 }
 var DEFAULT_AI_PROVIDERS = [
   {
@@ -3400,14 +3645,34 @@ var DEFAULT_AI_PROVIDERS = [
     sortOrder: 2
   },
   {
+    code: "pollinations",
+    name: "Pollinations Free AI (No Key)",
+    providerType: "pollinations",
+    model: "openai-fast",
+    apiBaseUrl: "https://text.pollinations.ai",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 3
+  },
+  {
     code: "gemini",
-    name: "Google Gemini",
+    name: "Google Gemini 4",
     providerType: "gemini",
     model: "gemini-4-hydrogen",
     apiBaseUrl: "",
     isActive: true,
     isDefault: false,
-    sortOrder: 3
+    sortOrder: 4
+  },
+  {
+    code: "openrouter_llama",
+    name: "OpenRouter (Llama 3.3 Free)",
+    providerType: "openrouter",
+    model: "meta-llama/llama-3.3-70b-instruct:free",
+    apiBaseUrl: "https://openrouter.ai/api/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 5
   },
   {
     code: "chatgpt",
@@ -3415,9 +3680,109 @@ var DEFAULT_AI_PROVIDERS = [
     providerType: "openai",
     model: "gpt-4o-mini",
     apiBaseUrl: "https://api.openai.com/v1",
-    isActive: false,
+    isActive: true,
     isDefault: false,
-    sortOrder: 4
+    sortOrder: 6
+  },
+  {
+    code: "groq",
+    name: "Groq (Llama 3.3 70B)",
+    providerType: "groq",
+    model: "llama-3.3-70b-versatile",
+    apiBaseUrl: "https://api.groq.com/openai/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 7
+  },
+  {
+    code: "deepseek",
+    name: "DeepSeek V3 AI",
+    providerType: "deepseek",
+    model: "deepseek-chat",
+    apiBaseUrl: "https://api.deepseek.com/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 8
+  },
+  {
+    code: "claude",
+    name: "Anthropic Claude",
+    providerType: "anthropic",
+    model: "claude-3-5-haiku-latest",
+    apiBaseUrl: "https://api.anthropic.com",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 9
+  },
+  {
+    code: "mistral",
+    name: "Mistral AI",
+    providerType: "mistral",
+    model: "mistral-small-latest",
+    apiBaseUrl: "https://api.mistral.ai/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 10
+  },
+  {
+    code: "grok",
+    name: "xAI Grok",
+    providerType: "xai",
+    model: "grok-2-latest",
+    apiBaseUrl: "https://api.x.ai/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 11
+  },
+  {
+    code: "together",
+    name: "Together AI",
+    providerType: "together",
+    model: "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+    apiBaseUrl: "https://api.together.xyz/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 12
+  },
+  {
+    code: "cerebras",
+    name: "Cerebras AI",
+    providerType: "cerebras",
+    model: "llama-3.3-70b",
+    apiBaseUrl: "https://api.cerebras.ai/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 13
+  },
+  {
+    code: "perplexity",
+    name: "Perplexity Sonar",
+    providerType: "perplexity",
+    model: "sonar",
+    apiBaseUrl: "https://api.perplexity.ai",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 14
+  },
+  {
+    code: "cohere",
+    name: "Cohere Command",
+    providerType: "cohere",
+    model: "command-a-03-2025",
+    apiBaseUrl: "https://api.cohere.com/compatibility/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 15
+  },
+  {
+    code: "huggingface",
+    name: "HuggingFace Qwen 2.5",
+    providerType: "huggingface",
+    model: "Qwen/Qwen2.5-72B-Instruct",
+    apiBaseUrl: "https://router.huggingface.co/v1",
+    isActive: true,
+    isDefault: false,
+    sortOrder: 16
   }
 ];
 function normalizeAiProviderCode(input) {
@@ -3439,15 +3804,14 @@ function isValidExternalAiBaseUrl(rawUrl) {
   }
 }
 function isAiProviderConfigured(row, envFlags = false) {
-  const flags = resolveAiEnvFlags(envFlags);
-  if (row.providerType === "foodora") {
+  if (row.providerType === "foodora" || row.providerType === "pollinations") {
     return true;
   }
   if (row.providerType === "gemini") {
-    return flags.hasGeminiKey;
+    return hasEnvKeyForAiProviderType("gemini", envFlags);
   }
-  if (row.providerType === "openrouter") {
-    return Boolean(row.apiKey && row.apiKey.trim() || flags.hasOpenRouterKey);
+  if (hasEnvKeyForAiProviderType(row.providerType, envFlags)) {
+    return true;
   }
   const hasKey = Boolean(row.apiKey && row.apiKey.trim());
   if (!hasKey) return false;
@@ -3459,12 +3823,20 @@ function isAiProviderConfigured(row, envFlags = false) {
 function toPublicAiProviderView(row, envFlags = false) {
   const allowedTypes = [
     "foodora",
+    "pollinations",
     "gemini",
     "openrouter",
     "openai",
     "groq",
     "deepseek",
     "anthropic",
+    "mistral",
+    "xai",
+    "together",
+    "cerebras",
+    "perplexity",
+    "cohere",
+    "huggingface",
     "custom_openai"
   ];
   const providerType = allowedTypes.includes(row.providerType) ? row.providerType : "custom_openai";
@@ -3483,16 +3855,18 @@ function toAdminAiProviderView(row, envFlags = false) {
   const flags = resolveAiEnvFlags(envFlags);
   const pub = toPublicAiProviderView(row, flags);
   const cleanKey = typeof row.apiKey === "string" ? row.apiKey.trim() : "";
-  const hasOpenRouterEnv = pub.providerType === "openrouter" && flags.hasOpenRouterKey;
+  const hasEnvForType = hasEnvKeyForAiProviderType(pub.providerType, flags);
   return {
     ...pub,
     apiBaseUrl: row.apiBaseUrl || "",
-    hasApiKey: pub.providerType === "foodora" ? true : pub.providerType === "gemini" ? flags.hasGeminiKey : Boolean(cleanKey || hasOpenRouterEnv),
-    apiKeyPreview: pub.providerType === "foodora" ? flags.hasGeminiKey ? "Foodora Own AI + Gemini" : "Built-in Foodora AI Ready" : pub.providerType === "gemini" ? flags.hasGeminiKey ? "Server Env Configured" : "Missing Env Key" : cleanKey ? maskSecretValue(cleanKey) : hasOpenRouterEnv ? "Server Env Configured" : ""
+    hasApiKey: pub.providerType === "foodora" || pub.providerType === "pollinations" ? true : pub.providerType === "gemini" ? flags.hasGeminiKey : Boolean(cleanKey || hasEnvForType),
+    apiKeyPreview: pub.providerType === "foodora" ? flags.hasGeminiKey ? "Foodora Own AI + Gemini" : "Built-in Foodora AI Ready" : pub.providerType === "pollinations" ? "Free Keyless AI Ready" : pub.providerType === "gemini" ? flags.hasGeminiKey ? "Server Env Configured" : "Missing Env Key" : cleanKey ? maskSecretValue(cleanKey) : hasEnvForType ? "Server Env Configured" : ""
   };
 }
 function buildOpenRouterChatPayload(options) {
   const cleanModel = (options.model || "").trim() || "google/gemma-4-31b-it:free";
+  const strictProvider = options.strictProvider !== false;
+  const enableReasoning = options.enableReasoning !== false;
   const messages = [
     { role: "system", content: options.systemInstruction },
     ...options.history.slice(-8).map((item) => {
@@ -3501,7 +3875,7 @@ function buildOpenRouterChatPayload(options) {
           role: "assistant",
           content: item.text
         };
-        if (item.reasoning_details !== void 0) {
+        if (enableReasoning && item.reasoning_details !== void 0) {
           msg.reasoning_details = item.reasoning_details;
         }
         return msg;
@@ -3515,16 +3889,75 @@ function buildOpenRouterChatPayload(options) {
   ];
   const payload = {
     model: cleanModel,
-    messages,
-    reasoning: { enabled: true }
+    messages
   };
-  if (cleanModel.includes("gemma-4") || cleanModel.startsWith("google/")) {
+  if (enableReasoning) {
+    payload.reasoning = { enabled: true };
+  }
+  if (strictProvider && (cleanModel.includes("gemma-4") || cleanModel.startsWith("google/"))) {
     payload.provider = {
       only: ["google-ai-studio"],
       allow_fallbacks: false
     };
   }
   return payload;
+}
+function extractAiReplyText(content) {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (Array.isArray(content)) {
+    const joined = content.map((part) => {
+      if (typeof part === "string") return part;
+      if (part && typeof part === "object") {
+        const obj = part;
+        if (typeof obj.text === "string") return obj.text;
+        if (typeof obj.content === "string") return obj.content;
+      }
+      return "";
+    }).filter(Boolean).join("\n").trim();
+    return joined;
+  }
+  if (content && typeof content === "object") {
+    const obj = content;
+    if (typeof obj.text === "string") return obj.text.trim();
+    if (typeof obj.content === "string") return obj.content.trim();
+    if (typeof obj.message === "string") return obj.message.trim();
+  }
+  return "";
+}
+function coerceSafeErrorText(err, fallback = "Something went wrong. Please try again.") {
+  if (typeof err === "string") {
+    const clean = err.trim();
+    return clean || fallback;
+  }
+  if (err instanceof Error) {
+    const clean = typeof err.message === "string" ? err.message.trim() : "";
+    return clean && clean !== "[object Object]" ? clean : fallback;
+  }
+  if (err && typeof err === "object") {
+    const obj = err;
+    if (typeof obj.error === "string" && obj.error.trim()) return obj.error.trim();
+    if (obj.error && typeof obj.error === "object") {
+      const nested = obj.error.message;
+      if (typeof nested === "string" && nested.trim()) return nested.trim();
+    }
+    if (typeof obj.message === "string" && obj.message.trim()) return obj.message.trim();
+  }
+  return fallback;
+}
+function filterGeminiCandidateModels(preferredModel) {
+  const cleanPreferred = String(preferredModel || "").trim();
+  const isValidGeminiModel = Boolean(cleanPreferred) && /^gemini-/i.test(cleanPreferred) && !cleanPreferred.includes("gemini-2.5") && !cleanPreferred.includes("gemini-1.5") && !cleanPreferred.includes("gemini-2.0");
+  return Array.from(
+    new Set(
+      [
+        ...isValidGeminiModel ? [cleanPreferred] : [],
+        "gemini-4-hydrogen",
+        "gemini-3.1-flash-lite"
+      ].filter(Boolean)
+    )
+  );
 }
 function shouldReplyInBanglaForAiHelp(message, langPreference = "auto", uiLang = "en") {
   if (langPreference === "bn") return true;
@@ -3546,26 +3979,29 @@ function generateFoodoraOwnAiReply(params) {
   );
   const openList = (params.openRestaurants || []).slice(0, 4);
   const openNames = openList.map((r) => `${r.name} (${r.area})`).join(", ");
+  if (/(messenger|whatsapp|support|contact|helpline|hotline|মেসেঞ্জার|হোয়াটসঅ্যাপ|সাপোর্ট|যোগাযোগ)/i.test(q)) {
+    return bn ? "Foodora BD \u09B8\u09BE\u09AA\u09CB\u09B0\u09CD\u099F\u09C7\u09B0 \u099C\u09A8\u09CD\u09AF \u098F\u0987 \u099A\u09CD\u09AF\u09BE\u099F \u0989\u0987\u09A8\u09CD\u09A1\u09CB\u09B0 \u0989\u09AA\u09B0\u09C7\u09B0 **Messenger** \u0985\u09A5\u09AC\u09BE **WhatsApp** \u09AC\u09BE\u099F\u09A8\u09C7 \u0995\u09CD\u09B2\u09BF\u0995 \u0995\u09B0\u09C7 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u0986\u09AE\u09BE\u09A6\u09C7\u09B0 \u09B8\u09BE\u09A5\u09C7 \u0995\u09A5\u09BE \u09AC\u09B2\u09A4\u09C7 \u09AA\u09BE\u09B0\u09C7\u09A8, \u0985\u09A5\u09AC\u09BE \u098F\u0987 **Website Live Chat**-\u098F\u0987 \u0986\u09AA\u09A8\u09BE\u09B0 \u09AA\u09CD\u09B0\u09B6\u09CD\u09A8 \u09B2\u09BF\u0996\u09C1\u09A8\u0964" : "You can reach Foodora BD Support directly via the **Messenger** or **WhatsApp** buttons at the top of this chat (or in the website footer), or keep chatting right here in **Website Live Chat**!";
+  }
   if (/(unavailable|closed|bandho|bondho|অর্ডার নেওয়া|বন্ধ|available|store open)/i.test(q)) {
     return bn ? '\u0995\u09CB\u09A8\u09CB \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F "unavailable" \u09A6\u09C7\u0996\u09BE\u09B2\u09C7 \u09AC\u09C1\u099D\u09A4\u09C7 \u09B9\u09AC\u09C7 \u09B8\u09C7\u099F\u09BF\u09B0 "Store Open" \u09AC\u09A8\u09CD\u09A7 \u0986\u099B\u09C7 \u0985\u09A5\u09AC\u09BE \u0985\u09CD\u09AF\u09BE\u09A1\u09AE\u09BF\u09A8 \u0985\u09A8\u09C1\u09AE\u09CB\u09A6\u09A8 (approved) \u09AC\u09BE\u0995\u09BF \u0986\u099B\u09C7\u0964 \u09AA\u09BE\u09B0\u09CD\u099F\u09A8\u09BE\u09B0 \u09A1\u09CD\u09AF\u09BE\u09B6\u09AC\u09CB\u09B0\u09CD\u09A1\u09C7\u09B0 Store Switch \u09A5\u09C7\u0995\u09C7 Store Open \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09B2\u09C7\u0987 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u09A8\u09C7\u0993\u09DF\u09BE \u09B6\u09C1\u09B0\u09C1 \u09B9\u09AC\u09C7\u0964 \u099A\u09BE\u0987\u09B2\u09C7 \u09B9\u09CB\u09AE\u09AA\u09C7\u099C\u09C7\u09B0 \u099A\u09BE\u09B2\u09C1 \u09A5\u09BE\u0995\u09BE \u0985\u09A8\u09CD\u09AF \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u09A5\u09C7\u0995\u09C7\u0993 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09C7\u09A8\u0964' : 'A restaurant appears unavailable when its "Store Open" toggle is switched OFF in the Partner/Admin Dashboard or its approval status is still pending. Re-opening the store toggle immediately re-enables ordering, or you can pick another Open restaurant on the home feed.';
   }
   if (/(job|apply|join|salary|নিয়োগ|জব|কাজ|আবেদন)/i.test(q)) {
-    return bn ? '\u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09AC\u09BE \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u09AA\u09BE\u09B0\u09CD\u099F\u09A8\u09BE\u09B0 \u09B9\u09A4\u09C7 \u099A\u09BE\u0987\u09B2\u09C7 \u0989\u09AA\u09B0\u09C7\u09B0 "Rider Job" \u09AC\u09BE "Partner" \u09B2\u09BF\u0982\u0995\u09C7 \u0995\u09CD\u09B2\u09BF\u0995 \u0995\u09B0\u09C1\u09A8\u0964 \u09AB\u09CD\u09B2\u09BF\u099F \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09B9\u09BF\u09B8\u09C7\u09AC\u09C7 \u099C\u09DF\u09C7\u09A8 \u0995\u09B0\u09B2\u09C7 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u0995\u09BF\u0989 \u09AA\u09BE\u09AC\u09C7\u09A8, \u0985\u09A5\u09AC\u09BE Rider Jobs \u09AC\u09CB\u09B0\u09CD\u09A1 \u09A5\u09C7\u0995\u09C7 \u09A8\u09BF\u09B0\u09CD\u09A6\u09BF\u09B7\u09CD\u099F \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F\u09C7\u09B0 \u09AE\u09BE\u09B8\u09BF\u0995/\u09B6\u09BF\u09AB\u099F \u09AD\u09BF\u09A4\u09CD\u09A4\u09BF\u0995 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u099A\u09BE\u0995\u09B0\u09BF\u09A4\u09C7 \u0986\u09AC\u09C7\u09A6\u09A8 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09AC\u09C7\u09A8\u0964' : 'To join as a delivery rider or restaurant partner, open "Rider Job" or "Partner" from the top navigation. You can join the active delivery fleet right away or apply to restaurant-posted Rider Jobs directly from the Rider Jobs tab.';
+    return bn ? '\u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09AC\u09BE \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u09AA\u09BE\u09B0\u09CD\u099F\u09A8\u09BE\u09B0 \u09B9\u09A4\u09C7 \u099A\u09BE\u0987\u09B2\u09C7 \u0989\u09AA\u09B0\u09C7\u09B0 "Rider Job" \u09AC\u09BE "Partner" \u09B2\u09BF\u0982\u0995\u09C7 \u0995\u09CD\u09B2\u09BF\u0995 \u0995\u09B0\u09C1\u09A8\u0964 \u09AC\u09BE\u0987\u09B8\u09BE\u0987\u0995\u09C7\u09B2 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0\u09A6\u09C7\u09B0 \u09A1\u09CD\u09B0\u09BE\u0987\u09AD\u09BF\u0982 \u09B2\u09BE\u0987\u09B8\u09C7\u09A8\u09CD\u09B8 \u099B\u09BE\u09DC\u09BE\u0987 \u09B6\u09C1\u09A7\u09C1\u09AE\u09BE\u09A4\u09CD\u09B0 \u0990\u099A\u09CD\u099B\u09BF\u0995 NID \u09A6\u09BF\u09DF\u09C7 \u0986\u09AC\u09C7\u09A6\u09A8 \u0995\u09B0\u09BE\u09B0 \u09B8\u09C1\u09AC\u09BF\u09A7\u09BE \u09B0\u09DF\u09C7\u099B\u09C7\u0964' : 'To join as a delivery rider or restaurant partner, open "Rider Job" or "Partner" from the top navigation. Bicycle riders can join without a driving license using an optional NID.';
   }
   if (/(pay|bkash|nagad|ssl|cod|cash|promo|coupon|discount|পেমেন্ট|বিকাশ|নগদ|ক্যাশ|প্রোমো)/i.test(q)) {
     return bn ? "Foodora BD-\u09A4\u09C7 bKash, Nagad, SSLCommerz \u098F\u09AC\u0982 Cash on Delivery (COD) \u09B8\u09AC \u09AE\u09BE\u09A7\u09CD\u09AF\u09AE\u0987 \u099A\u09BE\u09B2\u09C1 \u0986\u099B\u09C7\u0964 \u099A\u09C7\u0995\u0986\u0989\u099F\u09C7 FOODORA50 \u09AA\u09CD\u09B0\u09CB\u09AE\u09CB \u0995\u09CB\u09A1 \u09AC\u09CD\u09AF\u09AC\u09B9\u09BE\u09B0 \u0995\u09B0\u09B2\u09C7 \u09A8\u09BF\u09B0\u09CD\u09A6\u09BF\u09B7\u09CD\u099F \u09B6\u09B0\u09CD\u09A4\u09C7 \u09A1\u09BF\u09B8\u0995\u09BE\u0989\u09A8\u09CD\u099F \u09AA\u09BE\u0993\u09DF\u09BE \u09AF\u09BE\u09DF\u0964 \u09AA\u09C7\u09AE\u09C7\u09A8\u09CD\u099F \u09AE\u09C7\u09A5\u09A1 \u0993 API \u0997\u09C7\u099F\u0993\u09DF\u09C7 \u09B8\u09C1\u09AA\u09BE\u09B0 \u0985\u09CD\u09AF\u09BE\u09A1\u09AE\u09BF\u09A8\u09C7\u09B0 Backend Control \u09A5\u09C7\u0995\u09C7\u0993 \u0995\u09A8\u09AB\u09BF\u0997\u09BE\u09B0 \u0995\u09B0\u09BE \u09AF\u09BE\u09DF\u0964" : "Foodora BD supports bKash, Nagad, SSLCommerz, and Cash on Delivery (COD). You can apply promo codes like FOODORA50 at checkout, and Super Admins can manage live/sandbox gateways under Backend Control.";
   }
   if (/(track|rider|eta|gps|ট্র্যাক|রাইডার|অর্ডার.*(কোথায়|kothay|status)|(কোথায়|kothay).*(order|rider|ডেলিভারি))/i.test(q)) {
     const ordRef = params.activeOrderNumber ? ` (${params.activeOrderNumber})` : "";
-    return bn ? `\u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u099F\u09CD\u09B0\u09CD\u09AF\u09BE\u0995 \u0995\u09B0\u09A4\u09C7 \u09B9\u09C7\u09A1\u09BE\u09B0\u09C7\u09B0 "Track Rider" \u09AC\u09BE\u099F\u09A8\u09C7 \u0995\u09CD\u09B2\u09BF\u0995 \u0995\u09B0\u09C1\u09A8${ordRef} \u0985\u09A5\u09AC\u09BE \u099A\u09C7\u0995\u0986\u0989\u099F \u0987\u09AE\u09C7\u0987\u09B2 \u0993 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u09A8\u09AE\u09CD\u09AC\u09B0 \u09A6\u09BF\u09A8\u0964 \u09B8\u09C7\u0996\u09BE\u09A8\u09C7 \u09AE\u09CD\u09AF\u09BE\u09AA\u09C7 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0\u09C7\u09B0 \u09B2\u09BE\u0987\u09AD GPS \u0985\u09AC\u09B8\u09CD\u09A5\u09BE\u09A8, \u09A6\u09C2\u09B0\u09A4\u09CD\u09AC \u0993 \u09AA\u09CC\u0981\u099B\u09BE\u09A8\u09CB\u09B0 \u0986\u09A8\u09C1\u09AE\u09BE\u09A8\u09BF\u0995 \u09B8\u09AE\u09DF (ETA) \u09A6\u09C7\u0996\u09A4\u09C7 \u09AA\u09BE\u09AC\u09C7\u09A8\u0964 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09A1\u09CD\u09AF\u09BE\u09B6\u09AC\u09CB\u09B0\u09CD\u09A1\u09C7 \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u09AE\u09CD\u09AF\u09BE\u09A8 \u09AA\u09BF\u0995\u0986\u09AA \u0993 \u09A1\u09CD\u09B0\u09AA-\u0985\u09AB \u099B\u09AC\u09BF\u0993 \u0986\u09AA\u09B2\u09CB\u09A1 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09AC\u09C7\u09A8\u0964` : `Click "Track Rider" in the top bar${ordRef} or search using your Checkout Email + Order Number to view live rider GPS coordinates, route path, and ETA. On the Rider Dashboard, riders receive pickup & drop-off navigation, cash/online payment summary, and drop-off photo proof.`;
+    return bn ? `\u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u099F\u09CD\u09B0\u09CD\u09AF\u09BE\u0995 \u0995\u09B0\u09A4\u09C7 \u09B9\u09C7\u09A1\u09BE\u09B0\u09C7\u09B0 "Track Rider" \u09AC\u09BE\u099F\u09A8\u09C7 \u0995\u09CD\u09B2\u09BF\u0995 \u0995\u09B0\u09C1\u09A8${ordRef} \u0985\u09A5\u09AC\u09BE \u099A\u09C7\u0995\u0986\u0989\u099F \u0987\u09AE\u09C7\u0987\u09B2 \u0993 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u09A8\u09AE\u09CD\u09AC\u09B0 \u09A6\u09BF\u09A8\u0964 \u09B8\u09C7\u0996\u09BE\u09A8\u09C7 \u09AE\u09CD\u09AF\u09BE\u09AA\u09C7 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0\u09C7\u09B0 \u09B2\u09BE\u0987\u09AD GPS \u0985\u09AC\u09B8\u09CD\u09A5\u09BE\u09A8, \u09A6\u09C2\u09B0\u09A4\u09CD\u09AC \u0993 \u09AA\u09CC\u0981\u099B\u09BE\u09A8\u09CB\u09B0 \u0986\u09A8\u09C1\u09AE\u09BE\u09A8\u09BF\u0995 \u09B8\u09AE\u09DF (ETA) \u09A6\u09C7\u0996\u09A4\u09C7 \u09AA\u09BE\u09AC\u09C7\u09A8\u0964` : `Click "Track Rider" in the top bar${ordRef} or search using your Checkout Email + Order Number to view live rider GPS coordinates, route path, and ETA.`;
   }
-  if (/(owner|vendor|partner|stock|variant|variation|addon|dispatch|স্টক|ভেন্ডর|পার্টনার|ভ্যারিয়েশন)/i.test(q)) {
-    return bn ? "\u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u09AE\u09BE\u09B2\u09BF\u0995 (Partner Portal) \u09A5\u09C7\u0995\u09C7 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u09A1\u09BF\u09B8\u09AA\u09CD\u09AF\u09BE\u099A \u0993 \u09A8\u09BF\u099C\u09B8\u09CD\u09AC \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u09AE\u09CD\u09AF\u09BE\u09A8 \u09AF\u09CB\u0997/\u0985\u09CD\u09AF\u09BE\u09B8\u09BE\u0987\u09A8 \u0995\u09B0\u09BE \u09AF\u09BE\u09DF\u0964 Menu \u0993 Stock \u099F\u09CD\u09AF\u09BE\u09AC\u09C7 \u0997\u09BF\u09DF\u09C7 \u09AA\u09CD\u09B0\u09A4\u09BF\u099F\u09BF \u0996\u09BE\u09AC\u09BE\u09B0\u09C7\u09B0 \u09AA\u09CD\u09B0\u09CB\u09A1\u09BE\u0995\u09CD\u099F \u09AD\u09CD\u09AF\u09BE\u09B0\u09BF\u09DF\u09C7\u09B6\u09A8 (\u09AF\u09C7\u09AE\u09A8 Half/Full), \u0985\u09CD\u09AF\u09BE\u09A1-\u0985\u09A8 \u0993 In Stock \u09B8\u09CD\u099F\u09CD\u09AF\u09BE\u099F\u09BE\u09B8 \u09B8\u09BE\u09A5\u09C7 \u09B8\u09BE\u09A5\u09C7 \u0986\u09AA\u09A1\u09C7\u099F \u0995\u09B0\u09BE \u09AF\u09BE\u09DF, \u0986\u09B0 Rider Jobs \u09A5\u09C7\u0995\u09C7 \u09A8\u09A4\u09C1\u09A8 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09A8\u09BF\u09DF\u09CB\u0997\u0993 \u09A6\u09C7\u0993\u09DF\u09BE \u09AF\u09BE\u09DF\u0964" : "In the Partner Portal, restaurant owners can dispatch orders, add or assign their own delivery riders, edit menu items with custom product variations & add-ons, toggle In Stock availability live, and post Rider Jobs or message Platform Admin directly.";
+  if (/(owner|vendor|partner|branch|stock|variant|variation|addon|dispatch|শাখা|স্টক|ভেন্ডর|পার্টনার|ভ্যারিয়েশন)/i.test(q)) {
+    return bn ? "\u098F\u0995\u099C\u09A8 \u09AA\u09BE\u09B0\u09CD\u099F\u09A8\u09BE\u09B0 \u09E7\u099F\u09BF \u09AE\u09C2\u09B2 \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u0996\u09C1\u09B2\u09C7 \u098F\u09B0 \u0985\u09A7\u09C0\u09A8\u09C7 **Add Branch** \u09A6\u09BF\u09DF\u09C7 \u098F\u0995\u09BE\u09A7\u09BF\u0995 \u09B6\u09BE\u0996\u09BE \u09AF\u09CB\u0997 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09C7\u09A8\u0964 Menu \u0993 Stock \u099F\u09CD\u09AF\u09BE\u09AC\u09C7 \u09AA\u09CD\u09B0\u09CB\u09A1\u09BE\u0995\u09CD\u099F \u09AD\u09CD\u09AF\u09BE\u09B0\u09BF\u09DF\u09C7\u09B6\u09A8, \u0985\u09CD\u09AF\u09BE\u09A1-\u0985\u09A8 \u0993 In Stock \u0986\u09AA\u09A1\u09C7\u099F \u098F\u09AC\u0982 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u09A1\u09BF\u09B8\u09AA\u09CD\u09AF\u09BE\u099A \u09B8\u09AC\u0987 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u0995\u09B0\u09BE \u09AF\u09BE\u09DF\u0964" : "Each partner can open 1 primary restaurant and add multiple branches via **Add Branch**. Inside the Partner Portal you can dispatch orders, update stock/variations, and post Rider Jobs.";
   }
   if (/(restaurant|menu|food|biriyani|kacchi|burger|pizza|খাওয়া|খাবার|রেস্টুরেন্ট|অর্ডার)/i.test(q)) {
     return bn ? `${params.area ? `${params.area} \u098F\u09B2\u09BE\u0995\u09BE\u09DF ` : ""}\u09B9\u09CB\u09AE\u09AA\u09C7\u099C\u09C7\u09B0 "Order Popular Food Now" \u09AC\u09BE \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u0995\u09BE\u09B0\u09CD\u09A1 \u09A5\u09C7\u0995\u09C7 \u09AF\u09C7\u0995\u09CB\u09A8\u09CB \u09A1\u09BF\u09B6 \u0995\u09BE\u09B0\u09CD\u099F\u09C7 \u09AF\u09CB\u0997 \u0995\u09B0\u09C7 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09AC\u09C7\u09A8\u0964${openNames ? ` \u098F\u0996\u09A8 \u0996\u09CB\u09B2\u09BE \u0986\u099B\u09C7: ${openNames}\u0964` : ""} \u099A\u09BE\u0987\u09B2\u09C7 \u09AA\u099B\u09A8\u09CD\u09A6\u09C7\u09B0 \u0996\u09BE\u09AC\u09BE\u09B0\u09C7\u09B0 \u09A8\u09BE\u09AE \u09AC\u09B2\u09C1\u09A8, \u0986\u09AE\u09BF \u0996\u09C1\u0981\u099C\u09C7 \u09A6\u09BF\u09A4\u09C7 \u09B8\u09BE\u09B9\u09BE\u09AF\u09CD\u09AF \u0995\u09B0\u09AC\u09CB\u0964` : `Pick any dish from "Order Popular Food Now" or browse open restaurants${params.area ? ` around ${params.area}` : ""} to add items and checkout.${openNames ? ` Currently open: ${openNames}.` : ""} Tell me what craving you have and I can point you to it!`;
   }
-  return bn ? `\u0986\u09AE\u09BF Foodora BD-\u098F\u09B0 \u09A8\u09BF\u099C\u09B8\u09CD\u09AC AI \u09B8\u09B9\u09BE\u09DF\u0995\u0964${openNames ? ` \u098F\u0996\u09A8 \u09B8\u0995\u09CD\u09B0\u09BF\u09DF \u0995\u09BF\u099B\u09C1 \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F: ${openNames}\u0964` : ""} \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u0995\u09B0\u09BE, \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09B2\u09BE\u0987\u09AD \u099F\u09CD\u09B0\u09CD\u09AF\u09BE\u0995\u09BF\u0982, \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u09AE\u09CD\u09AF\u09BE\u09A8 \u099C\u09AC, \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u09AA\u09BE\u09B0\u09CD\u099F\u09A8\u09BE\u09B0 \u09A1\u09CD\u09AF\u09BE\u09B6\u09AC\u09CB\u09B0\u09CD\u09A1 \u09AC\u09BE bKash/COD \u09AA\u09C7\u09AE\u09C7\u09A8\u09CD\u099F \u09B8\u09AE\u09CD\u09AA\u09B0\u09CD\u0995\u09C7 \u09AF\u09C7\u0995\u09CB\u09A8\u09CB \u09AA\u09CD\u09B0\u09B6\u09CD\u09A8 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09C7\u09A8\u0964` : `I am Foodora BD's built-in AI assistant.${openNames ? ` Currently open stores include: ${openNames}.` : ""} Ask me anything about ordering food, live rider GPS tracking, Rider Dashboard pickup/drop-off steps, restaurant partner tools, or payments.`;
+  return bn ? `\u0986\u09AE\u09BF Foodora BD-\u098F\u09B0 \u09A8\u09BF\u099C\u09B8\u09CD\u09AC AI \u09B8\u09B9\u09BE\u09DF\u0995\u0964${openNames ? ` \u098F\u0996\u09A8 \u09B8\u0995\u09CD\u09B0\u09BF\u09DF \u0995\u09BF\u099B\u09C1 \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F: ${openNames}\u0964` : ""} \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u0995\u09B0\u09BE, \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09B2\u09BE\u0987\u09AD \u099F\u09CD\u09B0\u09CD\u09AF\u09BE\u0995\u09BF\u0982, \u09B6\u09BE\u0996\u09BE \u09AF\u09CB\u0997 \u0995\u09B0\u09BE, bKash/COD \u09AA\u09C7\u09AE\u09C7\u09A8\u09CD\u099F \u0995\u09BF\u0982\u09AC\u09BE Messenger / WhatsApp \u09B8\u09BE\u09AA\u09CB\u09B0\u09CD\u099F \u09B8\u09AE\u09CD\u09AA\u09B0\u09CD\u0995\u09C7 \u09AF\u09C7\u0995\u09CB\u09A8\u09CB \u09AA\u09CD\u09B0\u09B6\u09CD\u09A8 \u0995\u09B0\u09A4\u09C7 \u09AA\u09BE\u09B0\u09C7\u09A8\u0964` : `I am Foodora BD's built-in AI assistant.${openNames ? ` Currently open stores include: ${openNames}.` : ""} Ask me anything about ordering food, live rider tracking, branch setup, payments, or Messenger/WhatsApp support.`;
 }
 function validateRiderJobPayload(input) {
   const restaurantId = Number(input.restaurantId);
@@ -3812,6 +4248,623 @@ function buildBranchRestaurantNames(primaryName, primaryNameBn, branchLabel, bra
     nameBn: `${baseBn} \u2014 ${cleanBranchBn}`
   };
 }
+var BANGLADESH_DELIVERY_SERVICES = [
+  {
+    code: "pathao_food",
+    nameEn: "Pathao Food & Courier",
+    nameBn: "\u09AA\u09BE\u09A0\u09BE\u0993 \u09AB\u09C1\u09A1 \u0993 \u0995\u09C1\u09B0\u09BF\u09DF\u09BE\u09B0",
+    mode: "third_party",
+    minBaseFee: 55,
+    etaOffsetMin: 2,
+    coverageNoteEn: "Instant Pathao Food / Parcel rider across Bangladesh",
+    coverageNoteBn: "\u09AA\u09BE\u09A0\u09BE\u0993 \u09AB\u09C1\u09A1/\u0995\u09C1\u09B0\u09BF\u09DF\u09BE\u09B0\u09C7\u09B0 \u09AE\u09BE\u09A7\u09CD\u09AF\u09AE\u09C7 \u09B8\u09BE\u09B0\u09BE \u09AC\u09BE\u0982\u09B2\u09BE\u09A6\u09C7\u09B6\u09C7 \u09A6\u09CD\u09B0\u09C1\u09A4 \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF"
+  },
+  {
+    code: "foodora_express",
+    nameEn: "Foodora Express Rider",
+    nameBn: "\u09AB\u09C1\u09A1\u09CB\u09B0\u09BE \u098F\u0995\u09CD\u09B8\u09AA\u09CD\u09B0\u09C7\u09B8 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0",
+    mode: "platform",
+    minBaseFee: 35,
+    etaOffsetMin: 0,
+    coverageNoteEn: "Dedicated live GPS food rider fleet",
+    coverageNoteBn: "\u09B2\u09BE\u0987\u09AD \u099C\u09BF\u09AA\u09BF\u098F\u09B8 \u099F\u09CD\u09B0\u09CD\u09AF\u09BE\u0995\u09BF\u0982\u09B8\u09B9 \u09A8\u09BF\u099C\u09B8\u09CD\u09AC \u09AB\u09C1\u09A1 \u09B0\u09BE\u0987\u09A1\u09BE\u09B0"
+  },
+  {
+    code: "steadfast",
+    nameEn: "Steadfast Courier BD",
+    nameBn: "\u09B8\u09CD\u099F\u09C7\u09A1\u09AB\u09BE\u09B8\u09CD\u099F \u0995\u09C1\u09B0\u09BF\u09DF\u09BE\u09B0 \u09AC\u09BF\u09A1\u09BF",
+    mode: "third_party",
+    minBaseFee: 60,
+    etaOffsetMin: 5,
+    coverageNoteEn: "Nationwide 64-district food & parcel partner",
+    coverageNoteBn: "\u09EC\u09EA \u099C\u09C7\u09B2\u09BE\u09DF \u09B8\u09CD\u099F\u09C7\u09A1\u09AB\u09BE\u09B8\u09CD\u099F \u0995\u09C1\u09B0\u09BF\u09DF\u09BE\u09B0 \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u09B8\u09BE\u09AA\u09CB\u09B0\u09CD\u099F"
+  },
+  {
+    code: "redx",
+    nameEn: "RedX Delivery BD",
+    nameBn: "\u09B0\u09C7\u09A1\u098F\u0995\u09CD\u09B8 \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u09AC\u09BF\u09A1\u09BF",
+    mode: "third_party",
+    minBaseFee: 60,
+    etaOffsetMin: 5,
+    coverageNoteEn: "Express zone dispatch via RedX Bangladesh",
+    coverageNoteBn: "\u09B0\u09C7\u09A1\u098F\u0995\u09CD\u09B8-\u098F\u09B0 \u09AE\u09BE\u09A7\u09CD\u09AF\u09AE\u09C7 \u09A6\u09CD\u09B0\u09C1\u09A4 \u099C\u09CB\u09A8 \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF"
+  },
+  {
+    code: "paperfly",
+    nameEn: "Paperfly / eCourier BD",
+    nameBn: "\u09AA\u09C7\u09AA\u09BE\u09B0\u09AB\u09CD\u09B2\u09BE\u0987 / \u0987-\u0995\u09C1\u09B0\u09BF\u09DF\u09BE\u09B0",
+    mode: "third_party",
+    minBaseFee: 65,
+    etaOffsetMin: 7,
+    coverageNoteEn: "Doorstep courier coverage across Bangladesh",
+    coverageNoteBn: "\u09B8\u09BE\u09B0\u09BE \u09A6\u09C7\u09B6\u09C7\u09B0 \u09B9\u09CB\u09AE \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF \u0995\u09C1\u09B0\u09BF\u09DF\u09BE\u09B0 \u09A8\u09C7\u099F\u0993\u09DF\u09BE\u09B0\u09CD\u0995"
+  },
+  {
+    code: "restaurant_fleet",
+    nameEn: "Restaurant Own Rider",
+    nameBn: "\u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F\u09C7\u09B0 \u09A8\u09BF\u099C\u09B8\u09CD\u09AC \u09B0\u09BE\u0987\u09A1\u09BE\u09B0",
+    mode: "restaurant",
+    minBaseFee: 30,
+    etaOffsetMin: 0,
+    coverageNoteEn: "Dispatched directly by the restaurant kitchen",
+    coverageNoteBn: "\u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F\u09C7\u09B0 \u09A8\u09BF\u099C\u09B8\u09CD\u09AC \u09B0\u09BE\u0987\u09A1\u09BE\u09B0 \u09A6\u09CD\u09AC\u09BE\u09B0\u09BE \u09A1\u09C7\u09B2\u09BF\u09AD\u09BE\u09B0\u09BF"
+  }
+];
+function getBangladeshDeliveryServiceMeta(code) {
+  const clean = String(code || "").trim().toLowerCase();
+  return BANGLADESH_DELIVERY_SERVICES.find((s) => s.code === clean) || BANGLADESH_DELIVERY_SERVICES[0];
+}
+function selectAutoBangladeshiDeliveryService(options) {
+  const cleanPreferred = String(options.preferredServiceCode || "").trim().toLowerCase();
+  if (cleanPreferred) {
+    const matched = BANGLADESH_DELIVERY_SERVICES.find((s) => s.code === cleanPreferred);
+    if (matched) return matched;
+  }
+  const targetMode = options.deliveryModeOverride || options.restaurantDeliveryMode || "third_party";
+  if (targetMode === "third_party") {
+    return options.pathaoEnabled === false ? getBangladeshDeliveryServiceMeta("steadfast") : getBangladeshDeliveryServiceMeta("pathao_food");
+  }
+  if (targetMode === "restaurant") {
+    return getBangladeshDeliveryServiceMeta("restaurant_fleet");
+  }
+  return getBangladeshDeliveryServiceMeta("foodora_express");
+}
+var DELIVERY_VEHICLE_MODES = [
+  {
+    mode: "bicycle",
+    labelEn: "Cycle",
+    labelBn: "\u09B8\u09BE\u0987\u0995\u09C7\u09B2",
+    googleTravelMode: "BICYCLING",
+    osrmProfile: "cycling",
+    avgSpeedKmh: 14.5,
+    isBetaRoute: true
+  },
+  {
+    mode: "motorbike",
+    labelEn: "Motorbike",
+    labelBn: "\u09AC\u09BE\u0987\u0995",
+    googleTravelMode: "DRIVING",
+    osrmProfile: "driving",
+    avgSpeedKmh: 27,
+    isBetaRoute: true
+  },
+  {
+    mode: "auto",
+    labelEn: "Auto / CNG",
+    labelBn: "\u0985\u099F\u09CB / \u09B8\u09BF\u098F\u09A8\u099C\u09BF",
+    googleTravelMode: "DRIVING",
+    osrmProfile: "driving",
+    avgSpeedKmh: 20,
+    isBetaRoute: false
+  },
+  {
+    mode: "car",
+    labelEn: "Car",
+    labelBn: "\u0997\u09BE\u09DC\u09BF",
+    googleTravelMode: "DRIVING",
+    osrmProfile: "driving",
+    avgSpeedKmh: 26,
+    isBetaRoute: false
+  },
+  {
+    mode: "walking",
+    labelEn: "Walk",
+    labelBn: "\u09AA\u09BE\u09DF\u09C7 \u09B9\u09C7\u0981\u099F\u09C7",
+    googleTravelMode: "WALKING",
+    osrmProfile: "foot",
+    avgSpeedKmh: 4.8,
+    isBetaRoute: true
+  }
+];
+function normalizeDeliveryVehicleMode(vehicleType) {
+  const clean = String(vehicleType || "").trim().toLowerCase();
+  if (!clean) return "motorbike";
+  if (isBicycleVehicleType(clean)) return "bicycle";
+  if (clean.includes("walk") || clean.includes("foot") || clean.includes("\u09AA\u09BE\u09DF\u09C7") || clean.includes("\u09B9\u09C7\u0981\u099F\u09C7")) {
+    return "walking";
+  }
+  if (clean.includes("auto") || clean.includes("cng") || clean.includes("rickshaw") || clean.includes("easybike") || clean.includes("\u0985\u099F\u09CB") || clean.includes("\u09B8\u09BF\u098F\u09A8\u099C\u09BF") || clean.includes("\u09B0\u09BF\u0995\u09B6\u09BE")) {
+    return "auto";
+  }
+  if (clean.includes("car") || clean.includes("sedan") || clean.includes("pickup") || clean.includes("van") || clean.includes("truck") || clean.includes("micro") || clean.includes("\u0997\u09BE\u09DC\u09BF") || clean.includes("\u0997\u09BE\u09A1\u09BC\u09BF") || clean.includes("\u0995\u09BE\u09B0")) {
+    return "car";
+  }
+  return "motorbike";
+}
+function getDeliveryVehicleMeta(mode) {
+  return DELIVERY_VEHICLE_MODES.find((m) => m.mode === mode) || DELIVERY_VEHICLE_MODES[1];
+}
+function computeVehicleAdjustedDurations(input) {
+  const distM = Math.max(0, input.distanceMeters);
+  const rawDur = Math.max(60, input.durationSeconds);
+  const rawStatic = Math.max(60, input.staticDurationSeconds || rawDur);
+  const rawDelay = Math.max(0, rawDur - rawStatic);
+  if (input.vehicleMode === "bicycle") {
+    const cycleEstimateSec = Math.max(120, Math.round(distM / 1e3 / 14.5 * 3600));
+    const baseStatic = input.routeMatchesVehicle ? rawStatic : cycleEstimateSec;
+    const baseDur = input.routeMatchesVehicle ? Math.max(rawDur, Math.round(baseStatic + rawDelay * 0.25)) : Math.round(cycleEstimateSec + rawDelay * 0.25);
+    return { effectiveSec: baseDur, staticSec: baseStatic };
+  }
+  if (input.vehicleMode === "walking") {
+    const walkEstimateSec = Math.max(120, Math.round(distM / 1e3 / 4.8 * 3600));
+    const baseStatic = input.routeMatchesVehicle ? rawStatic : walkEstimateSec;
+    return { effectiveSec: input.routeMatchesVehicle ? rawDur : walkEstimateSec, staticSec: baseStatic };
+  }
+  if (input.vehicleMode === "motorbike") {
+    const motoOpenSec = Math.max(
+      120,
+      Math.min(rawStatic, Math.round(distM / 1e3 / 28 * 3600))
+    );
+    const filteredDelay = Math.round(rawDelay * 0.55);
+    return { effectiveSec: motoOpenSec + filteredDelay, staticSec: motoOpenSec };
+  }
+  if (input.vehicleMode === "auto") {
+    const autoOpenSec = Math.max(
+      rawStatic,
+      Math.round(distM / 1e3 / 20 * 3600)
+    );
+    const autoDelay = Math.round(rawDelay * 1.05);
+    return { effectiveSec: autoOpenSec + autoDelay, staticSec: autoOpenSec };
+  }
+  return { effectiveSec: rawDur, staticSec: rawStatic };
+}
+function estimateDhakaPeakTrafficFactor(hour24) {
+  const h = typeof hour24 === "number" && Number.isFinite(hour24) ? (Math.floor(hour24) % 24 + 24) % 24 : ((/* @__PURE__ */ new Date()).getUTCHours() + 6) % 24;
+  if (h >= 8 && h <= 11 || h >= 17 && h <= 21) {
+    return 1.38;
+  }
+  if (h >= 12 && h <= 16) {
+    return 1.2;
+  }
+  return 1.06;
+}
+function summarizeTrafficCongestion(input) {
+  const vehicleMode = input.vehicleMode || "car";
+  const safeDistM = Number.isFinite(input.distanceMeters) && input.distanceMeters >= 0 ? input.distanceMeters : 0;
+  const distanceKm = Math.round(safeDistM / 1e3 * 100) / 100;
+  const rawStaticSec = typeof input.staticDurationSeconds === "number" && Number.isFinite(input.staticDurationSeconds) && input.staticDurationSeconds > 0 ? input.staticDurationSeconds : input.durationSeconds;
+  const safeDurSec = Number.isFinite(input.durationSeconds) && input.durationSeconds > 0 ? input.durationSeconds : Math.max(120, Math.round(distanceKm * 180));
+  const safeStaticSec = Number.isFinite(rawStaticSec) && rawStaticSec > 0 ? rawStaticSec : safeDurSec;
+  const speedSegments = {
+    normalCount: 0,
+    slowCount: 0,
+    jamCount: 0
+  };
+  for (const rawSpeed of input.speedLevels || []) {
+    const level = String(rawSpeed || "").toUpperCase();
+    if (level === "TRAFFIC_JAM") speedSegments.jamCount += 1;
+    else if (level === "SLOW") speedSegments.slowCount += 1;
+    else if (level === "NORMAL") speedSegments.normalCount += 1;
+  }
+  let preVehicleDurSec = safeDurSec;
+  if (input.source !== "google_routes" && Math.abs(safeDurSec - safeStaticSec) < 5 && distanceKm > 0.2) {
+    const factor = typeof input.peakFactorOverride === "number" && input.peakFactorOverride >= 1 ? input.peakFactorOverride : estimateDhakaPeakTrafficFactor();
+    preVehicleDurSec = Math.round(safeStaticSec * factor);
+  }
+  const adjusted = computeVehicleAdjustedDurations({
+    vehicleMode,
+    distanceMeters: safeDistM,
+    durationSeconds: preVehicleDurSec,
+    staticDurationSeconds: safeStaticSec,
+    routeMatchesVehicle: input.routeMatchesVehicle ?? (vehicleMode !== "bicycle" && vehicleMode !== "walking")
+  });
+  const etaMinutes = Math.max(2, Math.round(adjusted.effectiveSec / 60));
+  const staticMinutes = Math.max(2, Math.round(adjusted.staticSec / 60));
+  const delayMinutes = Math.max(0, etaMinutes - staticMinutes);
+  const ratio = adjusted.staticSec > 0 ? adjusted.effectiveSec / adjusted.staticSec : 1;
+  let trafficSeverity = "clear";
+  if (speedSegments.jamCount > 0 || delayMinutes >= 6 || ratio >= 1.35) {
+    trafficSeverity = "heavy";
+  } else if (speedSegments.slowCount > 0 || delayMinutes >= 2 || ratio >= 1.15) {
+    trafficSeverity = "moderate";
+  }
+  const delayFormattedEn = delayMinutes > 0 ? formatDurationEstimate(delayMinutes, "en", "compact") : "";
+  const delayFormattedBn = delayMinutes > 0 ? formatDurationEstimate(delayMinutes, "bn", "compact") : "";
+  const delayTagEn = delayMinutes > 0 ? ` (+${delayFormattedEn} delay)` : "";
+  const delayTagBn = delayMinutes > 0 ? ` (+${delayFormattedBn} \u09A6\u09C7\u09B0\u09BF)` : "";
+  const trafficLabelEn = trafficSeverity === "heavy" ? `Heavy Jam${delayTagEn}` : trafficSeverity === "moderate" ? `Slow Traffic${delayTagEn}` : "Traffic Clear";
+  const trafficLabelBn = trafficSeverity === "heavy" ? `\u09B0\u09BE\u09B8\u09CD\u09A4\u09BE\u09DF \u09AD\u09BE\u09B0\u09C0 \u099C\u09CD\u09AF\u09BE\u09AE${delayTagBn}` : trafficSeverity === "moderate" ? `\u09AE\u09BE\u099D\u09BE\u09B0\u09BF \u09AF\u09BE\u09A8\u099C\u099F${delayTagBn}` : "\u09AF\u09BE\u09A8\u099C\u099F \u09A8\u09C7\u0987 (\u09AB\u09BE\u0981\u0995\u09BE)";
+  const jamAreasTextEn = speedSegments.jamCount > 0 || speedSegments.slowCount > 0 ? `${speedSegments.jamCount} jam segment(s) \xB7 ${speedSegments.slowCount} slow zone(s) \xB7 ${speedSegments.normalCount} clear` : trafficSeverity === "heavy" ? `Congestion detected along main intersections (${delayFormattedEn} slower than normal)` : trafficSeverity === "moderate" ? `Moderate urban traffic along route (${delayFormattedEn} slower)` : "Smooth traffic flow along the full delivery route";
+  const jamAreasTextBn = speedSegments.jamCount > 0 || speedSegments.slowCount > 0 ? `${speedSegments.jamCount}\u099F\u09BF \u09AD\u09BE\u09B0\u09C0 \u099C\u09CD\u09AF\u09BE\u09AE \xB7 ${speedSegments.slowCount}\u099F\u09BF \u09A7\u09C0\u09B0\u0997\u09A4\u09BF \xB7 ${speedSegments.normalCount}\u099F\u09BF \u09AB\u09BE\u0981\u0995\u09BE \u0985\u0982\u09B6` : trafficSeverity === "heavy" ? `\u09AE\u09C2\u09B2 \u09AE\u09CB\u09DC\u09C7 \u09AF\u09BE\u09A8\u099C\u099F \u09B0\u09DF\u09C7\u099B\u09C7 (\u09B8\u09CD\u09AC\u09BE\u09AD\u09BE\u09AC\u09BF\u0995\u09C7\u09B0 \u099A\u09C7\u09DF\u09C7 ${delayFormattedBn} \u09AC\u09C7\u09B6\u09BF)` : trafficSeverity === "moderate" ? `\u09B0\u09BE\u09B8\u09CD\u09A4\u09BE\u09DF \u09AE\u09BE\u099D\u09BE\u09B0\u09BF \u09AF\u09BE\u09A8\u099C\u099F \u09B0\u09DF\u09C7\u099B\u09C7 (+${delayFormattedBn})` : "\u09B8\u09AE\u09CD\u09AA\u09C2\u09B0\u09CD\u09A3 \u09B0\u09C1\u099F\u09C7 \u099A\u09B2\u09BE\u099A\u09B2 \u09B8\u09CD\u09AC\u09BE\u09AD\u09BE\u09AC\u09BF\u0995 \u0993 \u09AF\u09BE\u09A8\u099C\u099F\u09AE\u09C1\u0995\u09CD\u09A4";
+  return {
+    distanceKm,
+    etaMinutes,
+    staticMinutes,
+    delayMinutes,
+    vehicleMode,
+    trafficSeverity,
+    trafficLabelEn,
+    trafficLabelBn,
+    jamAreasTextEn,
+    jamAreasTextBn,
+    steps: [...input.steps || []].slice(0, 12),
+    speedSegments,
+    source: input.source || "estimated"
+  };
+}
+function buildOsrmDirectionInstruction(input) {
+  const type = String(input.type || "").toLowerCase();
+  const modifier = String(input.modifier || "").replace(/_/g, " ").trim();
+  const road = String(input.roadName || "").trim();
+  const onto = road ? ` onto ${road}` : "";
+  const onRoad = road ? ` on ${road}` : "";
+  if (type === "arrive") return "Arrive at destination";
+  if (type === "depart") return `Head ${modifier || "straight"}${onRoad}`;
+  if (type === "roundabout" || type === "rotary") {
+    return `Enter roundabout and continue${onto}`;
+  }
+  if (type === "merge") return `Merge ${modifier || ""}${onto}`.replace(/\s+/g, " ").trim();
+  if (type === "fork") return `Keep ${modifier || "straight"} at fork${onto}`;
+  if (type === "end of road") return `At end of road, turn ${modifier || "ahead"}${onto}`;
+  if (type === "turn" || type === "new name" || type === "continue") {
+    if (modifier === "straight" || modifier === "") {
+      return road ? `Continue onto ${road}` : "Continue straight";
+    }
+    return `Turn ${modifier}${onto}`;
+  }
+  return road ? `Follow ${road}` : "Continue along route";
+}
+var DHAKA_ZONE_PRESETS = [
+  {
+    code: "ZONE 01",
+    name: "GULSHAN",
+    nameBn: "\u0997\u09C1\u09B2\u09B6\u09BE\u09A8",
+    label: "ZONE 01 \u2014 GULSHAN",
+    defaultDeliveryFee: 60,
+    keywords: ["gulshan", "niketan", "shahjadpur", "\u0997\u09C1\u09B2\u09B6\u09BE\u09A8", "\u09A8\u09BF\u0995\u09C7\u09A4\u09A8", "\u09B6\u09BE\u09B9\u099C\u09BE\u09A6\u09AA\u09C1\u09B0", "zone 01"]
+  },
+  {
+    code: "ZONE 02",
+    name: "BANANI",
+    nameBn: "\u09AC\u09A8\u09BE\u09A8\u09C0",
+    label: "ZONE 02 \u2014 BANANI",
+    defaultDeliveryFee: 60,
+    keywords: ["banani", "kakoli", "chairman bari", "\u09AC\u09A8\u09BE\u09A8\u09C0", "\u0995\u09BE\u0995\u09B2\u09C0", "zone 02"]
+  },
+  {
+    code: "ZONE 03",
+    name: "DHANMONDI",
+    nameBn: "\u09A7\u09BE\u09A8\u09AE\u09A8\u09CD\u09A1\u09BF",
+    label: "ZONE 03 \u2014 DHANMONDI",
+    defaultDeliveryFee: 60,
+    keywords: ["dhanmondi", "satmasjid", "jigatola", "kalabagan", "\u09A7\u09BE\u09A8\u09AE\u09A8\u09CD\u09A1\u09BF", "\u099C\u09BF\u0997\u09BE\u09A4\u09B2\u09BE", "\u0995\u09B2\u09BE\u09AC\u09BE\u0997\u09BE\u09A8", "zone 03"]
+  },
+  {
+    code: "ZONE 04",
+    name: "MIRPUR",
+    nameBn: "\u09AE\u09BF\u09B0\u09AA\u09C1\u09B0",
+    label: "ZONE 04 \u2014 MIRPUR",
+    defaultDeliveryFee: 60,
+    keywords: ["mirpur", "pallabi", "kazipara", "shewrapara", "\u09AE\u09BF\u09B0\u09AA\u09C1\u09B0", "\u09AA\u09B2\u09CD\u09B2\u09AC\u09C0", "\u0995\u09BE\u099C\u09C0\u09AA\u09BE\u09DC\u09BE", "zone 04"]
+  },
+  {
+    code: "ZONE 05",
+    name: "UTTARA",
+    nameBn: "\u0989\u09A4\u09CD\u09A4\u09B0\u09BE",
+    label: "ZONE 05 \u2014 UTTARA",
+    defaultDeliveryFee: 65,
+    keywords: ["uttara", "rajlaxmi", "jashimuddin", "abdullahpur", "\u0989\u09A4\u09CD\u09A4\u09B0\u09BE", "\u09B0\u09BE\u099C\u09B2\u0995\u09CD\u09B7\u09CD\u09AE\u09C0", "zone 05"]
+  },
+  {
+    code: "ZONE 06",
+    name: "MOHAMMADPUR",
+    nameBn: "\u09AE\u09CB\u09B9\u09BE\u09AE\u09CD\u09AE\u09A6\u09AA\u09C1\u09B0",
+    label: "ZONE 06 \u2014 MOHAMMADPUR",
+    defaultDeliveryFee: 60,
+    keywords: ["mohammadpur", "town hall", "bosila", "adabor", "shyamoli", "\u09AE\u09CB\u09B9\u09BE\u09AE\u09CD\u09AE\u09A6\u09AA\u09C1\u09B0", "\u0986\u09A6\u09BE\u09AC\u09B0", "\u09B6\u09CD\u09AF\u09BE\u09AE\u09B2\u09C0", "zone 06"]
+  },
+  {
+    code: "ZONE 07",
+    name: "BASHUNDHARA",
+    nameBn: "\u09AC\u09B8\u09C1\u09A8\u09CD\u09A7\u09B0\u09BE",
+    label: "ZONE 07 \u2014 BASHUNDHARA",
+    defaultDeliveryFee: 65,
+    keywords: ["bashundhara", "jamuna future", "kuril", "vatara", "\u09AC\u09B8\u09C1\u09A8\u09CD\u09A7\u09B0\u09BE", "\u0995\u09C1\u09DC\u09BF\u09B2", "\u09AD\u09BE\u099F\u09BE\u09B0\u09BE", "zone 07"]
+  },
+  {
+    code: "ZONE 08",
+    name: "BADDA",
+    nameBn: "\u09AC\u09BE\u09A1\u09CD\u09A1\u09BE",
+    label: "ZONE 08 \u2014 BADDA",
+    defaultDeliveryFee: 60,
+    keywords: ["badda", "merul", "rampura", "aftabnagar", "\u09AC\u09BE\u09A1\u09CD\u09A1\u09BE", "\u09B0\u09BE\u09AE\u09AA\u09C1\u09B0\u09BE", "\u0986\u09AB\u09A4\u09BE\u09AC\u09A8\u0997\u09B0", "zone 08"]
+  },
+  {
+    code: "ZONE 09",
+    name: "MOTIJHEEL",
+    nameBn: "\u09AE\u09A4\u09BF\u099D\u09BF\u09B2",
+    label: "ZONE 09 \u2014 MOTIJHEEL",
+    defaultDeliveryFee: 60,
+    keywords: ["motijheel", "paltan", "fakirapool", "arambagh", "kamalapur", "\u09AE\u09A4\u09BF\u099D\u09BF\u09B2", "\u09AA\u09B2\u09CD\u099F\u09A8", "\u0995\u09AE\u09B2\u09BE\u09AA\u09C1\u09B0", "zone 09"]
+  },
+  {
+    code: "ZONE 10",
+    name: "OLD DHAKA",
+    nameBn: "\u09AA\u09C1\u09B0\u09BE\u09A8 \u09A2\u09BE\u0995\u09BE",
+    label: "ZONE 10 \u2014 OLD DHAKA",
+    defaultDeliveryFee: 60,
+    keywords: ["old dhaka", "chawkbazar", "bangshal", "lalbagh", "wari", "sutrapur", "\u09AA\u09C1\u09B0\u09BE\u09A8 \u09A2\u09BE\u0995\u09BE", "\u099A\u0995\u09AC\u09BE\u099C\u09BE\u09B0", "\u09B2\u09BE\u09B2\u09AC\u09BE\u0997", "\u0993\u09DF\u09BE\u09B0\u09C0", "zone 10"]
+  },
+  {
+    code: "ZONE 11",
+    name: "TEJGAON / FARMGATE",
+    nameBn: "\u09A4\u09C7\u099C\u0997\u09BE\u0981\u0993 / \u09AB\u09BE\u09B0\u09CD\u09AE\u0997\u09C7\u099F",
+    label: "ZONE 11 \u2014 TEJGAON / FARMGATE",
+    defaultDeliveryFee: 55,
+    keywords: ["tejgaon", "farmgate", "karwan", "kawran", "\u09A4\u09C7\u099C\u0997\u09BE\u0981\u0993", "\u09AB\u09BE\u09B0\u09CD\u09AE\u0997\u09C7\u099F", "\u0995\u09BE\u09B0\u0993\u09DF\u09BE\u09A8", "zone 11"]
+  },
+  {
+    code: "ZONE 12",
+    name: "KHILGAON",
+    nameBn: "\u0996\u09BF\u09B2\u0997\u09BE\u0981\u0993",
+    label: "ZONE 12 \u2014 KHILGAON",
+    defaultDeliveryFee: 60,
+    keywords: ["khilgaon", "taltola", "malibagh", "goran", "\u0996\u09BF\u09B2\u0997\u09BE\u0981\u0993", "\u09AE\u09BE\u09B2\u09BF\u09AC\u09BE\u0997", "\u0997\u09CB\u09B0\u09BE\u09A8", "zone 12"]
+  }
+];
+var DEFAULT_DELIVERY_FINANCIAL_CONFIG = {
+  paymentModel: "online_food_cash_delivery",
+  zoneFees: Object.fromEntries(DHAKA_ZONE_PRESETS.map((z2) => [z2.code, z2.defaultDeliveryFee])),
+  distancePricing: {
+    enabled: true,
+    baseDistanceKm: 3,
+    baseFee: 60,
+    perKmFee: 10,
+    minFee: 40,
+    maxFee: 180
+  },
+  riderEarningRule: {
+    mode: "percentage",
+    value: 75
+    // ৳45 on ৳60 delivery charge; ৳15 Foodora platform commission
+  },
+  settlementRules: {
+    maxOutstandingLimit: 500,
+    autoBlockDispatchAboveLimit: true,
+    requireCashConfirmation: true,
+    settlementCycleLabel: "Daily / When Outstanding Reaches Cap",
+    settlementInstructions: "Collect the delivery charge directly in cash from customers on delivery. Settle Foodora commission balance via Cash / bKash / Nagad to Admin when due. No automated payout for rider-collected cash."
+  }
+};
+function mergeDeliveryFinancialConfig(raw) {
+  const input = raw || {};
+  const rawZoneFees = input.zoneFees || {};
+  const mergedZoneFees = { ...DEFAULT_DELIVERY_FINANCIAL_CONFIG.zoneFees };
+  for (const preset of DHAKA_ZONE_PRESETS) {
+    const val = Number(rawZoneFees[preset.code]);
+    if (Number.isFinite(val) && val >= 0 && val <= 1e3) {
+      mergedZoneFees[preset.code] = Math.round(val);
+    }
+  }
+  const dp = input.distancePricing || {};
+  const re = input.riderEarningRule || {};
+  const sr = input.settlementRules || {};
+  const mode = re.mode === "fixed" ? "fixed" : "percentage";
+  const rawVal = Number(re.value);
+  const clampedValue = Number.isFinite(rawVal) ? mode === "percentage" ? Math.max(0, Math.min(100, Math.round(rawVal))) : Math.max(0, Math.round(rawVal)) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.riderEarningRule.value;
+  return {
+    paymentModel: "online_food_cash_delivery",
+    zoneFees: mergedZoneFees,
+    distancePricing: {
+      enabled: typeof dp.enabled === "boolean" ? dp.enabled : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.enabled,
+      baseDistanceKm: typeof dp.baseDistanceKm === "number" && Number.isFinite(dp.baseDistanceKm) && dp.baseDistanceKm >= 0 ? Math.min(30, dp.baseDistanceKm) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.baseDistanceKm,
+      baseFee: typeof dp.baseFee === "number" && Number.isFinite(dp.baseFee) && dp.baseFee >= 0 ? Math.round(dp.baseFee) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.baseFee,
+      perKmFee: typeof dp.perKmFee === "number" && Number.isFinite(dp.perKmFee) && dp.perKmFee >= 0 ? Math.round(dp.perKmFee) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.perKmFee,
+      minFee: typeof dp.minFee === "number" && Number.isFinite(dp.minFee) && dp.minFee >= 0 ? Math.round(dp.minFee) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.minFee,
+      maxFee: typeof dp.maxFee === "number" && Number.isFinite(dp.maxFee) && dp.maxFee >= 10 ? Math.round(dp.maxFee) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.maxFee
+    },
+    riderEarningRule: {
+      mode,
+      value: clampedValue
+    },
+    settlementRules: {
+      maxOutstandingLimit: typeof sr.maxOutstandingLimit === "number" && Number.isFinite(sr.maxOutstandingLimit) && sr.maxOutstandingLimit >= 50 ? Math.round(sr.maxOutstandingLimit) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.maxOutstandingLimit,
+      autoBlockDispatchAboveLimit: typeof sr.autoBlockDispatchAboveLimit === "boolean" ? sr.autoBlockDispatchAboveLimit : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.autoBlockDispatchAboveLimit,
+      requireCashConfirmation: typeof sr.requireCashConfirmation === "boolean" ? sr.requireCashConfirmation : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.requireCashConfirmation,
+      settlementCycleLabel: typeof sr.settlementCycleLabel === "string" && sr.settlementCycleLabel.trim() ? sr.settlementCycleLabel.trim().slice(0, 120) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.settlementCycleLabel,
+      settlementInstructions: typeof sr.settlementInstructions === "string" && sr.settlementInstructions.trim() ? sr.settlementInstructions.trim().slice(0, 500) : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.settlementInstructions
+    }
+  };
+}
+function matchDhakaDeliveryZone(areaOrZoneText) {
+  const clean = String(areaOrZoneText || "").trim().toLowerCase();
+  if (!clean) return null;
+  for (const preset of DHAKA_ZONE_PRESETS) {
+    if (clean === preset.code.toLowerCase() || clean === preset.name.toLowerCase() || clean === preset.label.toLowerCase() || preset.keywords.some((kw) => clean.includes(kw))) {
+      return preset;
+    }
+  }
+  return null;
+}
+function calculateZoneDistanceDeliveryFee(input) {
+  const cfg = mergeDeliveryFinancialConfig(input.config);
+  const matchedZone = matchDhakaDeliveryZone(input.area);
+  const zoneBaseFee = matchedZone ? cfg.zoneFees[matchedZone.code] ?? matchedZone.defaultDeliveryFee : void 0;
+  const distKm = typeof input.distanceKm === "number" && Number.isFinite(input.distanceKm) && input.distanceKm >= 0 ? input.distanceKm : null;
+  const base = zoneBaseFee ?? cfg.distancePricing.baseFee ?? Math.max(0, Math.round(input.fallbackFee ?? 60));
+  if (cfg.distancePricing.enabled && distKm !== null) {
+    const extraKm = Math.max(0, distKm - cfg.distancePricing.baseDistanceKm);
+    const rawFee = Math.round(base + extraKm * cfg.distancePricing.perKmFee);
+    const clamped = Math.max(cfg.distancePricing.minFee, Math.min(cfg.distancePricing.maxFee, rawFee));
+    return {
+      deliveryFee: clamped,
+      zoneCode: matchedZone?.code || null,
+      zoneName: matchedZone?.name || null,
+      pricingSource: matchedZone ? "zone_plus_distance" : "distance_rule"
+    };
+  }
+  if (zoneBaseFee !== void 0) {
+    return {
+      deliveryFee: Math.max(0, Math.round(zoneBaseFee)),
+      zoneCode: matchedZone?.code || null,
+      zoneName: matchedZone?.name || null,
+      pricingSource: "zone_base"
+    };
+  }
+  const fb = typeof input.fallbackFee === "number" && Number.isFinite(input.fallbackFee) ? Math.max(0, Math.round(input.fallbackFee)) : cfg.distancePricing.baseFee;
+  return {
+    deliveryFee: fb,
+    zoneCode: null,
+    zoneName: null,
+    pricingSource: "fallback"
+  };
+}
+function calculateSplitOrderFinancials(params) {
+  const base = calculateOrderFinancials(params);
+  const method = String(params.paymentMethod || "bkash").trim().toLowerCase();
+  const isLegacyCod = method === "cod";
+  const rule = params.riderEarningRule || DEFAULT_DELIVERY_FINANCIAL_CONFIG.riderEarningRule;
+  let riderEarningAmount = 0;
+  let foodoraDeliveryCommission = 0;
+  if (base.deliveryFee > 0) {
+    if (rule.mode === "fixed") {
+      riderEarningAmount = Math.min(base.deliveryFee, Math.max(0, Math.round(rule.value)));
+    } else {
+      const pct = Math.max(0, Math.min(100, Number(rule.value) || 0));
+      riderEarningAmount = Math.min(base.deliveryFee, Math.round(base.deliveryFee * pct / 100));
+    }
+    foodoraDeliveryCommission = Math.max(0, base.deliveryFee - riderEarningAmount);
+  }
+  if (isLegacyCod) {
+    return {
+      ...base,
+      paymentSplitMode: "legacy_cod",
+      onlineFoodPayable: 0,
+      cashDueToRider: base.totalPayable,
+      customerTotalCost: base.totalPayable,
+      riderEarningAmount,
+      foodoraDeliveryCommission
+    };
+  }
+  const onlineFoodPayable = base.netFoodRevenue + base.serviceFee + base.taxAmount;
+  const cashDueToRider = base.deliveryFee;
+  const customerTotalCost = onlineFoodPayable + cashDueToRider;
+  return {
+    ...base,
+    paymentSplitMode: "online_food_cash_delivery",
+    onlineFoodPayable,
+    cashDueToRider,
+    customerTotalCost,
+    riderEarningAmount,
+    foodoraDeliveryCommission
+  };
+}
+function canVendorProcessPrepaidOrder(order) {
+  const next = String(order.nextStatus || "").trim().toLowerCase();
+  if (next === "cancelled") {
+    return { allowed: true };
+  }
+  const method = String(order.paymentMethod || "").trim().toLowerCase();
+  const pStatus = String(order.paymentStatus || "").trim().toLowerCase();
+  if (method !== "cod" && pStatus !== "paid") {
+    return {
+      allowed: false,
+      reason: "Online food payment must be verified before the restaurant or rider can process this order."
+    };
+  }
+  return { allowed: true };
+}
+function summarizeRiderWalletLedger(entries) {
+  let totalCashCollected = 0;
+  let totalRiderEarnings = 0;
+  let totalCommissionOwed = 0;
+  let totalCommissionSettled = 0;
+  let deliveredCountFromLedger = 0;
+  for (const e of entries) {
+    totalCashCollected += Number(e.cashCollected) || 0;
+    totalRiderEarnings += Number(e.riderEarningDelta) || 0;
+    totalCommissionOwed += Number(e.commissionOwedDelta) || 0;
+    totalCommissionSettled += Number(e.commissionSettledDelta) || 0;
+    if (e.entryType === "delivery_earning") {
+      deliveredCountFromLedger += 1;
+    } else if (e.entryType === "commission_reversal") {
+      deliveredCountFromLedger = Math.max(0, deliveredCountFromLedger - 1);
+    }
+  }
+  return {
+    totalCashCollected: Math.max(0, Math.round(totalCashCollected)),
+    totalRiderEarnings: Math.max(0, Math.round(totalRiderEarnings)),
+    totalCommissionOwed: Math.max(0, Math.round(totalCommissionOwed)),
+    totalCommissionSettled: Math.max(0, Math.round(totalCommissionSettled)),
+    outstandingCommission: Math.max(0, Math.round(totalCommissionOwed - totalCommissionSettled)),
+    deliveredCountFromLedger
+  };
+}
+function canRiderAcceptOrders(input) {
+  const status = String(input.riderStatus || "").trim().toLowerCase();
+  if (status !== "approved") {
+    return {
+      allowed: false,
+      reason: status === "suspended" ? "Your rider account is currently suspended. Contact Foodora Admin." : "Your rider application is pending Admin approval for your Dhaka zone."
+    };
+  }
+  const rules = input.settlementRules || DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules;
+  const outstanding = Math.max(0, Math.round(input.outstandingCommission || 0));
+  if (rules.autoBlockDispatchAboveLimit && outstanding > rules.maxOutstandingLimit) {
+    return {
+      allowed: false,
+      reason: `Outstanding Foodora commission (\u09F3${outstanding}) exceeds limit (\u09F3${rules.maxOutstandingLimit}). Please settle commission with Admin to unlock new deliveries.`
+    };
+  }
+  return { allowed: true };
+}
+function summarizeDhakaZoneRiderCoverage(ridersList, config) {
+  const merged = mergeDeliveryFinancialConfig(config);
+  const buckets = /* @__PURE__ */ new Map();
+  for (const preset of DHAKA_ZONE_PRESETS) {
+    buckets.set(preset.code, { approved: 0, online: 0, pending: 0, suspended: 0 });
+  }
+  for (const rider of ridersList) {
+    const matched = matchDhakaDeliveryZone(rider.zone);
+    if (!matched) continue;
+    const bucket = buckets.get(matched.code);
+    if (!bucket) continue;
+    const status = String(rider.status || "").trim().toLowerCase();
+    if (status === "approved") {
+      bucket.approved += 1;
+      if (rider.isAvailable) bucket.online += 1;
+    } else if (status === "pending") {
+      bucket.pending += 1;
+    } else if (status === "suspended") {
+      bucket.suspended += 1;
+    }
+  }
+  return DHAKA_ZONE_PRESETS.map((preset) => {
+    const bucket = buckets.get(preset.code) || { approved: 0, online: 0, pending: 0, suspended: 0 };
+    return {
+      zoneCode: preset.code,
+      zoneName: preset.name,
+      zoneNameBn: preset.nameBn,
+      zoneLabel: preset.label,
+      approvedCount: bucket.approved,
+      onlineCount: bucket.online,
+      pendingCount: bucket.pending,
+      suspendedCount: bucket.suspended,
+      deliveryFee: merged.zoneFees[preset.code] ?? preset.defaultDeliveryFee,
+      hasActiveCoverage: bucket.online > 0 || bucket.approved > 0
+    };
+  });
+}
 
 // src/db/queries.ts
 async function getApprovedRestaurants() {
@@ -3961,14 +5014,22 @@ async function getOrderById(orderId) {
         };
       }
     }
-    const emailLogs = await db.select().from(orderEmailLogs).where(eq(orderEmailLogs.orderId, orderId)).orderBy(desc(orderEmailLogs.sentAt));
+    const [emailLogs, transactions, settings] = await Promise.all([
+      db.select().from(orderEmailLogs).where(eq(orderEmailLogs.orderId, orderId)).orderBy(desc(orderEmailLogs.sentAt)),
+      db.select().from(paymentTransactions).where(eq(paymentTransactions.orderId, orderId)).orderBy(asc(paymentTransactions.id)),
+      getPlatformSettingsRow()
+    ]);
     return {
       order,
       history,
       restaurant: restRows[0] ?? null,
       riderLocation,
       nearestRider,
-      emailLogs
+      emailLogs,
+      transactions,
+      deliveryFinancialConfig: mergeDeliveryFinancialConfig(
+        settings?.deliveryFinancialConfig || null
+      )
     };
   } catch (error) {
     console.error("Failed to fetch order detail:", error);
@@ -4117,7 +5178,7 @@ async function getVendorWorkspace(ownerUid, isSuperAdmin, requestedRestaurantId)
 }
 async function getRiderWorkspace(riderUid) {
   try {
-    const [riderRows, userRows, allOrders, allRestaurants] = await Promise.all([
+    const [riderRows, userRows, allOrders, allRestaurants, walletEntries, settings, allRiders] = await Promise.all([
       db.select().from(riders).where(eq(riders.uid, riderUid)).limit(1),
       db.select({ avatarUrl: users.avatarUrl }).from(users).where(eq(users.uid, riderUid)).limit(1),
       db.select().from(orders).orderBy(desc(orders.createdAt)),
@@ -4128,7 +5189,10 @@ async function getRiderWorkspace(riderUid) {
         lng: restaurants.lng,
         address: restaurants.address,
         phone: restaurants.phone
-      }).from(restaurants)
+      }).from(restaurants),
+      db.select().from(riderWalletLedger).where(eq(riderWalletLedger.riderUid, riderUid)).orderBy(desc(riderWalletLedger.createdAt)),
+      getPlatformSettingsRow(),
+      db.select().from(riders)
     ]);
     const restCoordMap = new Map(
       allRestaurants.map((r) => [
@@ -4146,20 +5210,32 @@ async function getRiderWorkspace(riderUid) {
         restaurantPhone: coords?.phone || ""
       };
     });
-    const availableOrders = withRestCoords.filter(
-      (o) => o.deliveryMode === "platform" && !o.riderUid && ["accepted", "preparing", "ready"].includes(o.status)
-    );
-    const assignedOrders = withRestCoords.filter((o) => o.riderUid === riderUid);
     const baseRider = riderRows[0] ?? null;
+    const isApprovedRider = baseRider?.status === "approved";
+    const availableOrders = isApprovedRider ? withRestCoords.filter(
+      (o) => o.deliveryMode === "platform" && !o.riderUid && ["accepted", "preparing", "ready"].includes(o.status) && (o.paymentMethod === "cod" || o.paymentStatus === "paid")
+    ) : [];
+    const assignedOrders = withRestCoords.filter((o) => o.riderUid === riderUid);
+    const walletSummary = summarizeRiderWalletLedger(walletEntries);
+    const financialConfig = mergeDeliveryFinancialConfig(
+      settings?.deliveryFinancialConfig || null
+    );
+    const zoneCoverage = summarizeDhakaZoneRiderCoverage(allRiders, financialConfig);
     const enrichedRider = baseRider ? {
       ...baseRider,
       avatarUrl: userRows[0]?.avatarUrl || "",
-      restaurantName: baseRider.restaurantId ? restCoordMap.get(baseRider.restaurantId)?.name || null : null
+      restaurantName: baseRider.restaurantId ? restCoordMap.get(baseRider.restaurantId)?.name || null : null,
+      walletSummary
     } : null;
     return {
       rider: enrichedRider,
       availableOrders,
-      assignedOrders
+      assignedOrders,
+      walletSummary,
+      walletLedger: walletEntries,
+      settlementRules: financialConfig.settlementRules,
+      deliveryFinancialConfig: financialConfig,
+      zoneCoverage
     };
   } catch (error) {
     console.error("Failed to load rider workspace:", error);
@@ -4179,7 +5255,9 @@ async function getAdminWorkspace() {
       allRiders,
       recentAuditLogs,
       settings,
-      adminPinCreds
+      adminPinCreds,
+      allTransactions,
+      allWalletLedger
     ] = await Promise.all([
       db.select().from(restaurants).orderBy(desc(restaurants.createdAt)),
       db.select().from(foodItems).orderBy(desc(foodItems.id)),
@@ -4191,13 +5269,29 @@ async function getAdminWorkspace() {
       db.select().from(riders).orderBy(desc(riders.createdAt)),
       db.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(60),
       getPlatformSettingsRow(),
-      db.select({ email: localCredentials.email }).from(localCredentials).where(like(localCredentials.email, "__admin_pin__:%"))
+      db.select({ email: localCredentials.email }).from(localCredentials).where(like(localCredentials.email, "__admin_pin__:%")),
+      db.select().from(paymentTransactions).orderBy(desc(paymentTransactions.createdAt)).limit(250),
+      db.select().from(riderWalletLedger).orderBy(desc(riderWalletLedger.createdAt)).limit(300)
     ]);
     const adminPinEmailSet = new Set(PROTECTED_SUPER_ADMIN_EMAILS);
     for (const row of adminPinCreds) {
       const stripped = row.email.replace(/^__admin_pin__:/, "").trim().toLowerCase();
       if (stripped) adminPinEmailSet.add(stripped);
     }
+    const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+      settings?.deliveryFinancialConfig || null
+    );
+    const ledgerByRider = /* @__PURE__ */ new Map();
+    for (const entry of allWalletLedger) {
+      const list = ledgerByRider.get(entry.riderUid) || [];
+      list.push(entry);
+      ledgerByRider.set(entry.riderUid, list);
+    }
+    const enrichedRiders = allRiders.map((r) => ({
+      ...r,
+      walletSummary: summarizeRiderWalletLedger(ledgerByRider.get(r.uid) || [])
+    }));
+    const dhakaZoneCoverage = summarizeDhakaZoneRiderCoverage(allRiders, deliveryFinancialConfig);
     return {
       restaurants: allRestaurants,
       products: allProducts,
@@ -4206,10 +5300,14 @@ async function getAdminWorkspace() {
       ledger: allLedger,
       payouts: allPayouts,
       coupons: allCoupons,
-      riders: allRiders,
+      riders: enrichedRiders,
       auditLogs: recentAuditLogs,
       settings,
-      adminPinEmails: Array.from(adminPinEmailSet)
+      adminPinEmails: Array.from(adminPinEmailSet),
+      deliveryFinancialConfig,
+      dhakaZoneCoverage,
+      paymentTransactions: allTransactions,
+      riderWalletLedger: allWalletLedger
     };
   } catch (error) {
     console.error("Failed to load admin workspace:", error);
@@ -4507,7 +5605,10 @@ var DEFAULT_STOREFRONT_CONFIG = {
   seoDescriptionEn: "Order food online from top Dhaka restaurants & cloud kitchens. Fast delivery across Gulshan, Banani, Dhanmondi, Uttara & Mirpur with bKash, Nagad & SSLCommerz.",
   seoDescriptionBn: "\u0997\u09C1\u09B2\u09B6\u09BE\u09A8, \u09AC\u09A8\u09BE\u09A8\u09C0, \u09A7\u09BE\u09A8\u09AE\u09A8\u09CD\u09A1\u09BF, \u0989\u09A4\u09CD\u09A4\u09B0\u09BE \u0993 \u09AE\u09BF\u09B0\u09AA\u09C1\u09B0\u09C7\u09B0 \u09B8\u09C7\u09B0\u09BE \u09B0\u09C7\u09B8\u09CD\u099F\u09C1\u09B0\u09C7\u09A8\u09CD\u099F \u09A5\u09C7\u0995\u09C7 \u09AC\u09BF\u0995\u09BE\u09B6, \u09A8\u0997\u09A6 \u0993 \u0995\u09BE\u09B0\u09CD\u09A1\u09C7 \u09A6\u09CD\u09B0\u09C1\u09A4 \u0996\u09BE\u09AC\u09BE\u09B0 \u0985\u09B0\u09CD\u09A1\u09BE\u09B0 \u0995\u09B0\u09C1\u09A8\u0964",
   seoKeywords: "food delivery dhaka, online food order bangladesh, kacchi biriyani dhaka, bKash food delivery, restaurant marketplace bangladesh",
-  googleSiteVerification: ""
+  googleSiteVerification: "",
+  messengerUrl: "https://www.facebook.com/messages/t/mdrakib.roni.1",
+  whatsappNumber: "+8801712345678",
+  supportEmail: "support@foodorabd.com"
 };
 function mergeStorefrontConfig(raw) {
   if (!raw || typeof raw !== "object") {
@@ -4534,6 +5635,7 @@ function mergeStorefrontConfig(raw) {
 var FoodoraOwnRiderProvider = class {
   constructor() {
     this.name = "Foodora Express Rider";
+    this.serviceCode = "foodora_express";
     this.mode = "platform";
   }
   isConfigured() {
@@ -4549,6 +5651,7 @@ var FoodoraOwnRiderProvider = class {
     const { fee, etaMinutes } = estimateDeliveryFeeAndEta(distanceKm, order.baseFee, "platform");
     return {
       provider: this.name,
+      serviceCode: this.serviceCode,
       mode: "platform",
       distanceKm,
       fee,
@@ -4559,6 +5662,7 @@ var FoodoraOwnRiderProvider = class {
   async createDelivery(order) {
     return {
       provider: this.name,
+      serviceCode: this.serviceCode,
       consignmentId: `FDR-${order.orderNumber}`,
       status: "awaiting_rider",
       isSandbox: false
@@ -4573,7 +5677,8 @@ var FoodoraOwnRiderProvider = class {
 };
 var RestaurantSelfDeliveryProvider = class {
   constructor() {
-    this.name = "Restaurant Own Fleet";
+    this.name = "Restaurant Own Rider";
+    this.serviceCode = "restaurant_fleet";
     this.mode = "restaurant";
   }
   isConfigured() {
@@ -4589,6 +5694,7 @@ var RestaurantSelfDeliveryProvider = class {
     const { fee, etaMinutes } = estimateDeliveryFeeAndEta(distanceKm, order.baseFee, "restaurant");
     return {
       provider: this.name,
+      serviceCode: this.serviceCode,
       mode: "restaurant",
       distanceKm,
       fee,
@@ -4599,6 +5705,7 @@ var RestaurantSelfDeliveryProvider = class {
   async createDelivery(order) {
     return {
       provider: this.name,
+      serviceCode: this.serviceCode,
       consignmentId: `RST-${order.orderNumber}`,
       status: "restaurant_dispatched",
       isSandbox: false
@@ -4613,7 +5720,8 @@ var RestaurantSelfDeliveryProvider = class {
 };
 var PathaoDeliveryProvider = class {
   constructor() {
-    this.name = "Pathao Courier";
+    this.name = "Pathao Food & Courier";
+    this.serviceCode = "pathao_food";
     this.mode = "third_party";
   }
   isConfigured() {
@@ -4635,21 +5743,76 @@ var PathaoDeliveryProvider = class {
     );
     return {
       provider: this.name,
+      serviceCode: this.serviceCode,
       mode: "third_party",
       distanceKm,
       fee,
-      etaMinutes,
-      isSandbox: !this.isConfigured()
+      etaMinutes: etaMinutes + 2,
+      isSandbox: !this.isConfigured() || process.env.PATHAO_SANDBOX === "true"
     };
   }
   async createDelivery(order) {
-    const isLive = this.isConfigured() && process.env.PATHAO_SANDBOX !== "true";
+    const isLive = this.isConfigured() && process.env.PATHAO_SANDBOX !== "true" && Boolean(process.env.PATHAO_STORE_ID);
+    if (isLive) {
+      const baseUrl = (process.env.PATHAO_BASE_URL || "https://api-hermes.pathao.com").replace(/\/+$/, "");
+      try {
+        const tokenResp = await fetch(`${baseUrl}/aladdin/api/v1/issue-token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            client_id: process.env.PATHAO_CLIENT_ID,
+            client_secret: process.env.PATHAO_CLIENT_SECRET,
+            grant_type: "password",
+            username: process.env.PATHAO_USERNAME,
+            password: process.env.PATHAO_PASSWORD
+          })
+        });
+        const tokenJson = await tokenResp.json().catch(() => ({}));
+        if (tokenResp.ok && tokenJson.access_token) {
+          const orderResp = await fetch(`${baseUrl}/aladdin/api/v1/orders`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${tokenJson.access_token}`
+            },
+            body: JSON.stringify({
+              store_id: Number(process.env.PATHAO_STORE_ID),
+              merchant_order_id: order.orderNumber,
+              recipient_name: order.customerName,
+              recipient_phone: order.customerPhone.replace(/^\+88/, ""),
+              recipient_address: `${order.dropoffAddress}, ${order.dropoffArea}`,
+              recipient_city: 1,
+              recipient_zone: 1,
+              delivery_type: 48,
+              item_type: 2,
+              item_quantity: 1,
+              item_weight: 0.5,
+              amount_to_collect: Math.max(0, Math.round(order.orderValue)),
+              item_description: `Food order from ${order.restaurantName}`
+            })
+          });
+          const orderJson = await orderResp.json().catch(() => ({}));
+          const liveId = orderJson?.data?.consignment_id;
+          if (orderResp.ok && liveId) {
+            return {
+              provider: "Pathao Food & Courier",
+              serviceCode: this.serviceCode,
+              consignmentId: liveId,
+              status: "consignment_created",
+              isSandbox: false
+            };
+          }
+        }
+      } catch {
+      }
+    }
     const suffix = Math.random().toString(36).slice(2, 8).toUpperCase();
     return {
-      provider: isLive ? "Pathao Courier" : "Pathao Courier (Sandbox)",
+      provider: isLive ? "Pathao Food & Courier" : "Pathao Food & Courier (Sandbox)",
+      serviceCode: this.serviceCode,
       consignmentId: `PT-BD-${suffix}`,
       status: "consignment_created",
-      isSandbox: !isLive
+      isSandbox: true
     };
   }
   async trackDelivery(_consignmentId) {
@@ -4659,7 +5822,141 @@ var PathaoDeliveryProvider = class {
     return { cancelled: true };
   }
 };
-function getDeliveryProvider(mode) {
+var BangladeshiPartnerCourierProvider = class {
+  constructor(serviceCode) {
+    this.mode = "third_party";
+    const meta = getBangladeshDeliveryServiceMeta(serviceCode);
+    this.serviceCode = serviceCode;
+    this.name = meta.nameEn;
+  }
+  isConfigured() {
+    if (this.serviceCode === "steadfast") {
+      return Boolean(process.env.STEADFAST_API_KEY && process.env.STEADFAST_SECRET_KEY);
+    }
+    if (this.serviceCode === "redx") {
+      return Boolean(process.env.REDX_ACCESS_TOKEN);
+    }
+    return false;
+  }
+  async getQuote(order) {
+    const meta = getBangladeshDeliveryServiceMeta(this.serviceCode);
+    const distanceKm = haversineDistanceKm(
+      order.pickupLat,
+      order.pickupLng,
+      order.dropoffLat,
+      order.dropoffLng
+    );
+    const { fee, etaMinutes } = estimateDeliveryFeeAndEta(
+      distanceKm,
+      Math.max(meta.minBaseFee, order.baseFee),
+      "third_party"
+    );
+    return {
+      provider: this.name,
+      serviceCode: this.serviceCode,
+      mode: "third_party",
+      distanceKm,
+      fee,
+      etaMinutes: etaMinutes + meta.etaOffsetMin,
+      isSandbox: !this.isConfigured()
+    };
+  }
+  async createDelivery(order) {
+    if (this.serviceCode === "steadfast" && this.isConfigured()) {
+      try {
+        const resp = await fetch("https://portal.packzy.com/api/v1/create_order", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Api-Key": process.env.STEADFAST_API_KEY || "",
+            "Secret-Key": process.env.STEADFAST_SECRET_KEY || ""
+          },
+          body: JSON.stringify({
+            invoice: order.orderNumber,
+            recipient_name: order.customerName,
+            recipient_phone: order.customerPhone.replace(/^\+88/, ""),
+            recipient_address: `${order.dropoffAddress}, ${order.dropoffArea}`,
+            cod_amount: Math.max(0, Math.round(order.orderValue)),
+            note: `Food order from ${order.restaurantName}`
+          })
+        });
+        const json = await resp.json().catch(() => ({}));
+        const liveId = json?.consignment?.tracking_code || json?.consignment?.consignment_id;
+        if (resp.ok && liveId) {
+          return {
+            provider: this.name,
+            serviceCode: this.serviceCode,
+            consignmentId: String(liveId),
+            status: "consignment_created",
+            isSandbox: false
+          };
+        }
+      } catch {
+      }
+    }
+    if (this.serviceCode === "redx" && this.isConfigured()) {
+      try {
+        const resp = await fetch("https://openapi.redx.com.bd/v1.0.0-beta/parcel", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "API-ACCESS-TOKEN": `Bearer ${process.env.REDX_ACCESS_TOKEN}`
+          },
+          body: JSON.stringify({
+            customer_name: order.customerName,
+            customer_phone: order.customerPhone.replace(/^\+88/, ""),
+            delivery_area: order.dropoffArea,
+            delivery_area_id: 1,
+            customer_address: order.dropoffAddress,
+            merchant_invoice_id: order.orderNumber,
+            cash_collection_amount: Math.max(0, Math.round(order.orderValue)),
+            parcel_weight: 500
+          })
+        });
+        const json = await resp.json().catch(() => ({}));
+        if (resp.ok && json?.tracking_id) {
+          return {
+            provider: this.name,
+            serviceCode: this.serviceCode,
+            consignmentId: json.tracking_id,
+            status: "consignment_created",
+            isSandbox: false
+          };
+        }
+      } catch {
+      }
+    }
+    const prefix = this.serviceCode === "steadfast" ? "SF-BD" : this.serviceCode === "redx" ? "RX-BD" : "PF-BD";
+    const suffix = Math.random().toString(36).slice(2, 8).toUpperCase();
+    return {
+      provider: `${this.name} (Sandbox)`,
+      serviceCode: this.serviceCode,
+      consignmentId: `${prefix}-${suffix}`,
+      status: "consignment_created",
+      isSandbox: true
+    };
+  }
+  async trackDelivery(_consignmentId) {
+    return { status: "picked_up", updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+  }
+  async cancelDelivery(_consignmentId) {
+    return { cancelled: true };
+  }
+};
+function getDeliveryProvider(mode, serviceCode) {
+  const cleanCode = String(serviceCode || "").trim().toLowerCase();
+  if (cleanCode === "steadfast" || cleanCode === "redx" || cleanCode === "paperfly") {
+    return new BangladeshiPartnerCourierProvider(cleanCode);
+  }
+  if (cleanCode === "pathao_food") {
+    return new PathaoDeliveryProvider();
+  }
+  if (cleanCode === "restaurant_fleet") {
+    return new RestaurantSelfDeliveryProvider();
+  }
+  if (cleanCode === "foodora_express") {
+    return new FoodoraOwnRiderProvider();
+  }
   switch (mode) {
     case "third_party":
       return new PathaoDeliveryProvider();
@@ -5123,26 +6420,94 @@ async function reverseOsmGeocode(lat, lng, lang = "en") {
     };
   }
 }
-async function fetchOsrmRoute(fromLat, fromLng, toLat, toLng) {
-  const key = `osrm:${fromLat.toFixed(3)},${fromLng.toFixed(3)}->${toLat.toFixed(3)},${toLng.toFixed(3)}`;
+async function fetchOsrmRoute(fromLat, fromLng, toLat, toLng, options) {
+  const includeSteps = Boolean(options?.includeSteps);
+  const vehicleMode = options?.vehicleMode ? normalizeDeliveryVehicleMode(String(options.vehicleMode)) : "car";
+  const vehicleMeta = getDeliveryVehicleMeta(vehicleMode);
+  const key = `osrm:${includeSteps ? "full" : "min"}:${vehicleMode}:${fromLat.toFixed(3)},${fromLng.toFixed(3)}->${toLat.toFixed(3)},${toLng.toFixed(3)}`;
   const cached = getCached(key);
   if (cached) return cached;
   try {
-    const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=false`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(3500) });
-    if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
-    const data = await res.json();
-    const route = data.routes?.[0];
+    const query = includeSteps ? "overview=full&geometries=geojson&steps=true" : "overview=false";
+    const tryOsrmProfile = async (profile) => {
+      const url = `https://router.project-osrm.org/route/v1/${profile}/${fromLng},${fromLat};${toLng},${toLat}?${query}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(4e3) });
+      if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
+      return await res.json();
+    };
+    let usedProfile = vehicleMeta.osrmProfile;
+    let data = await tryOsrmProfile(usedProfile).catch(async () => {
+      if (usedProfile !== "driving") {
+        usedProfile = "driving";
+        return tryOsrmProfile("driving");
+      }
+      throw new Error("OSRM unavailable");
+    });
+    let route = data.routes?.[0];
+    if (!route && usedProfile !== "driving") {
+      usedProfile = "driving";
+      data = await tryOsrmProfile("driving");
+      route = data.routes?.[0];
+    }
     if (!route) throw new Error("No OSRM route");
     const distanceKm = Math.round(route.distance / 1e3 * 100) / 100;
-    const drivingMinutes = Math.max(5, Math.round(route.duration / 60));
-    return setCached(key, { distanceKm, drivingMinutes, source: "OSRM" }, 5 * 60 * 1e3);
+    const routeMatchesVehicle = usedProfile === vehicleMeta.osrmProfile;
+    const steps = includeSteps ? (route.legs || []).flatMap((leg) => leg.steps || []).map((st) => ({
+      instruction: buildOsrmDirectionInstruction({
+        type: st.maneuver?.type,
+        modifier: st.maneuver?.modifier,
+        roadName: st.name
+      }),
+      distanceMeters: Number(st.distance || 0),
+      durationSeconds: Number(st.duration || 0),
+      maneuver: st.maneuver?.type,
+      roadName: st.name || void 0
+    })) : [];
+    const trafficSummary = summarizeTrafficCongestion({
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      staticDurationSeconds: route.duration,
+      steps,
+      source: "osrm",
+      vehicleMode,
+      routeMatchesVehicle
+    });
+    if (!includeSteps) {
+      return setCached(
+        key,
+        { distanceKm, drivingMinutes: trafficSummary.etaMinutes, source: "OSRM" },
+        5 * 60 * 1e3
+      );
+    }
+    const coordinates = (route.geometry?.coordinates || []).filter((pt) => Array.isArray(pt) && pt.length >= 2 && Number.isFinite(pt[0]) && Number.isFinite(pt[1])).map(([lng, lat]) => ({ lat, lng }));
+    return setCached(
+      key,
+      {
+        distanceKm,
+        drivingMinutes: trafficSummary.etaMinutes,
+        source: "OSRM",
+        coordinates,
+        steps,
+        trafficSummary
+      },
+      5 * 60 * 1e3
+    );
   } catch {
     const distanceKm = haversineDistanceKm(fromLat, fromLng, toLat, toLng);
+    const estDurationSec = Math.max(360, Math.round(distanceKm * 252));
+    const trafficSummary = summarizeTrafficCongestion({
+      distanceMeters: Math.round(distanceKm * 1e3),
+      durationSeconds: estDurationSec,
+      staticDurationSeconds: estDurationSec,
+      source: "estimated",
+      vehicleMode,
+      routeMatchesVehicle: false
+    });
     return {
       distanceKm,
-      drivingMinutes: Math.max(6, Math.round(distanceKm * 4.2)),
-      source: "Haversine"
+      drivingMinutes: trafficSummary.etaMinutes,
+      source: "Haversine",
+      ...includeSteps ? { trafficSummary, steps: [] } : {}
     };
   }
 }
@@ -5975,6 +7340,9 @@ async function sendAndLogOrderTrackingEmail(params) {
     riderPhone: params.riderPhone,
     etaMinutes: params.etaMinutes,
     createdAt: params.createdAt,
+    paymentSplitMode: params.paymentSplitMode,
+    onlineFoodPaidAmount: params.onlineFoodPaidAmount,
+    cashDueToRider: params.cashDueToRider,
     items: enrichedItems
   });
   const dispatchResult = await sendTransactionalEmail({
@@ -6471,6 +7839,146 @@ async function settleOrderCommissionIdempotent(orderId) {
     });
   });
 }
+async function recordRiderDeliveryWalletIdempotent(orderId, collectedCashInput, actorUid = "system") {
+  await db.transaction(async (tx) => {
+    const orderRows = await tx.select().from(orders).where(eq5(orders.id, orderId)).limit(1);
+    if (orderRows.length === 0) return;
+    const order = orderRows[0];
+    const expectedCash = order.paymentSplitMode === "online_food_cash_delivery" ? Math.max(0, order.cashDueToRider || order.deliveryFee || 0) : order.paymentMethod === "cod" ? Math.max(0, order.totalAmount) : 0;
+    const finalCollectedCash = typeof collectedCashInput === "number" && Number.isFinite(collectedCashInput) ? Math.max(0, Math.round(collectedCashInput)) : expectedCash;
+    if (order.cashCollectionStatus !== "collected") {
+      await tx.update(orders).set({
+        cashCollectionStatus: "collected",
+        cashCollectedAmount: finalCollectedCash,
+        cashCollectedAt: /* @__PURE__ */ new Date(),
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(eq5(orders.id, order.id));
+    }
+    const delCashKey = `delivery_cash:${order.orderNumber}`;
+    const existingDelTx = await tx.select().from(paymentTransactions).where(eq5(paymentTransactions.idempotencyKey, delCashKey)).limit(1);
+    if (existingDelTx.length > 0) {
+      await tx.update(paymentTransactions).set({
+        amount: finalCollectedCash,
+        status: "succeeded",
+        riderUid: order.riderUid || existingDelTx[0].riderUid || "",
+        note: `Cash delivery charge collected by rider (${actorUid})`,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(eq5(paymentTransactions.idempotencyKey, delCashKey));
+    } else {
+      await tx.insert(paymentTransactions).values({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        txKind: "delivery_cash",
+        idempotencyKey: delCashKey,
+        payerRole: "customer",
+        recipientRole: "rider",
+        paymentMethod: "cash",
+        amount: finalCollectedCash,
+        status: "succeeded",
+        riderUid: order.riderUid || "",
+        note: `Cash delivery charge collected by rider (${actorUid})`
+      }).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    }
+    if (!order.riderUid) return;
+    const earnKey = `delivery_earn:${order.orderNumber}`;
+    const existingEarn = await tx.select().from(riderWalletLedger).where(eq5(riderWalletLedger.idempotencyKey, earnKey)).limit(1);
+    if (existingEarn.length > 0) {
+      return;
+    }
+    const riderShare = order.riderEarningAmount > 0 ? order.riderEarningAmount : Math.max(0, Math.round((order.cashDueToRider || order.deliveryFee || 0) * 0.75));
+    const foodoraCommission = order.foodoraDeliveryCommission > 0 || (order.cashDueToRider || order.deliveryFee) > 0 ? Math.max(0, (order.cashDueToRider || order.deliveryFee || 0) - riderShare) : 0;
+    await tx.insert(riderWalletLedger).values({
+      riderUid: order.riderUid,
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      entryType: "delivery_earning",
+      idempotencyKey: earnKey,
+      cashCollected: finalCollectedCash,
+      riderEarningDelta: riderShare,
+      commissionOwedDelta: 0,
+      commissionSettledDelta: 0,
+      referenceId: `DEL-${order.orderNumber}`,
+      note: `Cash collected \u09F3${finalCollectedCash} \xB7 Rider earned \u09F3${riderShare}`
+    }).onConflictDoNothing({ target: riderWalletLedger.idempotencyKey });
+    if (foodoraCommission > 0) {
+      await tx.insert(riderWalletLedger).values({
+        riderUid: order.riderUid,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        entryType: "commission_owed",
+        idempotencyKey: `commission_owed:${order.orderNumber}`,
+        cashCollected: 0,
+        riderEarningDelta: 0,
+        commissionOwedDelta: foodoraCommission,
+        commissionSettledDelta: 0,
+        referenceId: `COM-${order.orderNumber}`,
+        note: `Foodora delivery commission owed on ${order.orderNumber}`
+      }).onConflictDoNothing({ target: riderWalletLedger.idempotencyKey });
+    }
+    await tx.update(riders).set({
+      totalDeliveries: sql3`${riders.totalDeliveries} + 1`,
+      totalEarnings: sql3`${riders.totalEarnings} + ${riderShare}`
+    }).where(eq5(riders.uid, order.riderUid));
+  });
+}
+async function reverseOrderSplitFinancialsTx(tx, order, reason) {
+  const foodPaidAmt = order.paymentSplitMode === "online_food_cash_delivery" ? Math.max(0, order.onlineFoodPaidAmount || 0) : Math.max(0, order.totalAmount);
+  if (order.paymentStatus === "paid" && foodPaidAmt > 0) {
+    await tx.insert(paymentTransactions).values({
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      txKind: "food_refund",
+      idempotencyKey: `food_refund:${order.orderNumber}`,
+      payerRole: "platform",
+      recipientRole: "customer",
+      paymentMethod: order.paymentMethod,
+      amount: foodPaidAmt,
+      status: "refunded",
+      gatewayTxId: order.paymentTxId || "",
+      note: reason
+    }).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+  }
+  const delCashKey = `delivery_cash:${order.orderNumber}`;
+  if (order.cashCollectionStatus === "collected") {
+    await tx.insert(paymentTransactions).values({
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      txKind: "delivery_reversal",
+      idempotencyKey: `delivery_reversal:${order.orderNumber}`,
+      payerRole: "rider",
+      recipientRole: "customer",
+      paymentMethod: "cash",
+      amount: order.cashCollectedAmount || order.cashDueToRider || order.deliveryFee || 0,
+      status: "refunded",
+      riderUid: order.riderUid || "",
+      note: reason
+    }).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    await tx.update(orders).set({ cashCollectionStatus: "reversed", updatedAt: /* @__PURE__ */ new Date() }).where(eq5(orders.id, order.id));
+  } else {
+    await tx.update(paymentTransactions).set({ status: "cancelled", note: reason, updatedAt: /* @__PURE__ */ new Date() }).where(eq5(paymentTransactions.idempotencyKey, delCashKey));
+  }
+  if (order.riderUid) {
+    const existingEarn = await tx.select().from(riderWalletLedger).where(eq5(riderWalletLedger.idempotencyKey, `delivery_earn:${order.orderNumber}`)).limit(1);
+    if (existingEarn.length > 0) {
+      const earnRow = existingEarn[0];
+      const existingOwed = await tx.select().from(riderWalletLedger).where(eq5(riderWalletLedger.idempotencyKey, `commission_owed:${order.orderNumber}`)).limit(1);
+      const owedAmt = existingOwed[0]?.commissionOwedDelta || 0;
+      await tx.insert(riderWalletLedger).values({
+        riderUid: order.riderUid,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        entryType: "commission_reversal",
+        idempotencyKey: `delivery_rev:${order.orderNumber}`,
+        cashCollected: -(earnRow.cashCollected || 0),
+        riderEarningDelta: -(earnRow.riderEarningDelta || 0),
+        commissionOwedDelta: -owedAmt,
+        commissionSettledDelta: 0,
+        referenceId: `REV-${order.orderNumber}`,
+        note: reason
+      }).onConflictDoNothing({ target: riderWalletLedger.idempotencyKey });
+    }
+  }
+}
 function getRequestOrigin(req) {
   const protoHeader = String(req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim();
   const hostHeader = String(req.headers["x-forwarded-host"] || req.get("host") || "localhost:3000").split(",")[0].trim();
@@ -6489,7 +7997,32 @@ app.get("/sitemap.xml", async (req, res) => {
     const approved = hasDatabaseConfig() ? await getApprovedRestaurants() : [];
     const xml = buildSitemapXml(
       getRequestOrigin(req),
-      approved.map((r) => ({ slug: r.slug, updatedAt: r.updatedAt }))
+      approved.map((r) => ({ slug: r.slug, updatedAt: r.updatedAt })),
+      {
+        areas: [
+          "Gulshan 2",
+          "Banani",
+          "Dhanmondi",
+          "Uttara",
+          "Mirpur",
+          "Bashundhara R/A",
+          "Motijheel",
+          "Chattogram",
+          "Sylhet",
+          "Rajshahi",
+          "Khulna"
+        ],
+        cuisines: [
+          "Biriyani",
+          "Burger",
+          "Pizza",
+          "Bangladeshi",
+          "Kabab",
+          "Chinese & Momos",
+          "Bakery & Cakes",
+          "Coffee & Drinks"
+        ]
+      }
     );
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=900");
@@ -6525,7 +8058,7 @@ app.get("/api/health", async (_req, res) => {
 });
 app.get("/api/public-config", async (_req, res) => {
   try {
-    const [settings, gatewayRows, activeOrderRows] = await Promise.all([
+    const [settings, gatewayRows, activeOrderRows, allRiders] = await Promise.all([
       getPlatformSettingsRow(),
       ensureDefaultPaymentGateways(),
       db.select({
@@ -6534,7 +8067,12 @@ app.get("/api/public-config", async (_req, res) => {
         trackingToken: orders.trackingToken,
         restaurantName: orders.restaurantName,
         estimatedMinutes: orders.estimatedMinutes
-      }).from(orders).where(and2(ne(orders.status, "delivered"), ne(orders.status, "cancelled"))).orderBy(desc3(orders.createdAt)).limit(30).catch(() => [])
+      }).from(orders).where(and2(ne(orders.status, "delivered"), ne(orders.status, "cancelled"))).orderBy(desc3(orders.createdAt)).limit(30).catch(() => []),
+      db.select({
+        zone: riders.zone,
+        status: riders.status,
+        isAvailable: riders.isAvailable
+      }).from(riders).catch(() => [])
     ]);
     const paymentGatewaysList = gatewayRows.map(
       (row) => toPublicPaymentGatewayView(row, isEnvConfiguredForGateway(row.code))
@@ -6544,7 +8082,11 @@ app.get("/api/public-config", async (_req, res) => {
     if (!sc.googleSiteVerification && process.env.GOOGLE_SITE_VERIFICATION) {
       sc.googleSiteVerification = process.env.GOOGLE_SITE_VERIFICATION.trim();
     }
-    const settingsWithVerification = settings ? { ...settings, storefrontConfig: sc } : settings;
+    const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+      settings?.deliveryFinancialConfig || null
+    );
+    const dhakaZoneCoverage = summarizeDhakaZoneRiderCoverage(allRiders, deliveryFinancialConfig);
+    const settingsWithVerification = settings ? { ...settings, storefrontConfig: sc, deliveryFinancialConfig } : settings;
     const pinnedId = Number(sc.featuredActiveOrderId);
     const activeRow = sc.showActiveDeliveryBar === false ? void 0 : (Number.isInteger(pinnedId) && pinnedId > 0 ? activeOrderRows.find((r) => r.id === pinnedId) : void 0) || activeOrderRows[0];
     res.json({
@@ -6553,6 +8095,8 @@ app.get("/api/public-config", async (_req, res) => {
       paymentGateways: paymentGatewaysList,
       emailTransport,
       settings: settingsWithVerification,
+      deliveryFinancialConfig,
+      dhakaZoneCoverage,
       featuredActiveOrder: activeRow ? {
         orderId: activeRow.id,
         trackingToken: activeRow.trackingToken,
@@ -6842,10 +8386,17 @@ app.post("/api/auth/register", async (req, res) => {
           phone: "+8801700000000",
           email: emailLower,
           vehicleType: "Motorbike",
-          zone: "Gulshan 2",
-          isAvailable: true,
-          status: "approved"
+          zone: "ZONE 01 \u2014 GULSHAN",
+          isAvailable: false,
+          status: "pending"
         }).onConflictDoNothing();
+        await tx.insert(notifications).values({
+          recipientUid: "role-super_admin",
+          roleTarget: "super_admin",
+          title: "New Dhaka Zone Rider Pending Approval",
+          message: `${fullName} registered as a rider and awaits zone approval.`,
+          type: "system"
+        });
       }
     });
     const token = signSandboxToken({ uid, email: emailLower, fullName, role, isSandbox: false });
@@ -7272,7 +8823,12 @@ app.get("/api/free/route", async (req, res) => {
   if (![fromLat, fromLng, toLat, toLng].every(Number.isFinite)) {
     return res.status(400).json({ error: "Invalid coordinates" });
   }
-  const route = await fetchOsrmRoute(fromLat, fromLng, toLat, toLng);
+  const includeSteps = req.query.steps === "1" || req.query.steps === "true";
+  const vehicleMode = typeof req.query.mode === "string" ? req.query.mode : void 0;
+  const route = await fetchOsrmRoute(fromLat, fromLng, toLat, toLng, {
+    includeSteps,
+    vehicleMode
+  });
   res.json({ route });
 });
 app.get("/api/free/rates", async (_req, res) => {
@@ -7289,17 +8845,31 @@ app.post("/api/delivery/quote", async (req, res) => {
     restaurantId: z.number().int().positive(),
     dropoffLat: z.number(),
     dropoffLng: z.number(),
-    deliveryMode: z.enum(["platform", "restaurant", "third_party"])
+    dropoffArea: z.string().trim().max(120).optional(),
+    deliveryMode: z.enum(["platform", "restaurant", "third_party"]).optional(),
+    deliveryServiceCode: z.string().trim().max(32).optional()
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid delivery quote parameters" });
   }
   try {
-    const rows = await db.select().from(restaurants).where(eq5(restaurants.id, parsed.data.restaurantId)).limit(1);
-    if (rows.length === 0) return res.status(404).json({ error: "Restaurant not found" });
-    const rest = rows[0];
-    const provider = getDeliveryProvider(parsed.data.deliveryMode);
+    const [restRows, settingsRows] = await Promise.all([
+      db.select().from(restaurants).where(eq5(restaurants.id, parsed.data.restaurantId)).limit(1),
+      db.select().from(platformSettings).limit(1).catch(() => [])
+    ]);
+    if (restRows.length === 0) return res.status(404).json({ error: "Restaurant not found" });
+    const rest = restRows[0];
+    const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+      settingsRows[0]?.deliveryFinancialConfig || null
+    );
+    const selectedService = selectAutoBangladeshiDeliveryService({
+      restaurantDeliveryMode: rest.deliveryMode,
+      preferredServiceCode: parsed.data.deliveryServiceCode,
+      deliveryModeOverride: parsed.data.deliveryMode,
+      pathaoEnabled: settingsRows[0]?.pathaoEnabled ?? true
+    });
+    const provider = getDeliveryProvider(selectedService.mode, selectedService.code);
     const [baseQuote, osrmRoute, weather] = await Promise.all([
       provider.getQuote({
         orderNumber: "QUOTE",
@@ -7308,7 +8878,7 @@ app.post("/api/delivery/quote", async (req, res) => {
         pickupLat: rest.lat,
         pickupLng: rest.lng,
         dropoffAddress: "Customer Pin",
-        dropoffArea: rest.area,
+        dropoffArea: parsed.data.dropoffArea || rest.area,
         dropoffLat: parsed.data.dropoffLat,
         dropoffLng: parsed.data.dropoffLng,
         customerName: "Guest",
@@ -7319,18 +8889,33 @@ app.post("/api/delivery/quote", async (req, res) => {
       fetchOsrmRoute(rest.lat, rest.lng, parsed.data.dropoffLat, parsed.data.dropoffLng),
       fetchDhakaWeather(parsed.data.dropoffLat, parsed.data.dropoffLng)
     ]);
-    const baseFeeInput = parsed.data.deliveryMode === "third_party" ? Math.max(55, rest.deliveryFee) : rest.deliveryFee;
+    const baseFeeInput = selectedService.mode === "third_party" ? Math.max(selectedService.minBaseFee, rest.deliveryFee) : rest.deliveryFee;
     const roadCalc = estimateDeliveryFeeAndEta(
       osrmRoute.distanceKm,
       baseFeeInput,
-      parsed.data.deliveryMode
+      selectedService.mode
     );
+    const zoneDistanceCalc = calculateZoneDistanceDeliveryFee({
+      area: parsed.data.dropoffArea || rest.area,
+      distanceKm: osrmRoute.distanceKm,
+      fallbackFee: roadCalc.fee,
+      config: deliveryFinancialConfig
+    });
     res.json({
       quote: {
         ...baseQuote,
+        serviceCode: selectedService.code,
+        provider: provider.name,
+        mode: selectedService.mode,
         distanceKm: osrmRoute.distanceKm,
-        fee: roadCalc.fee,
-        etaMinutes: Math.max(12, osrmRoute.drivingMinutes + 12 + weather.rainBufferMin),
+        fee: zoneDistanceCalc.deliveryFee,
+        zoneCode: zoneDistanceCalc.zoneCode,
+        zoneName: zoneDistanceCalc.zoneName,
+        pricingSource: zoneDistanceCalc.pricingSource,
+        etaMinutes: Math.max(
+          12,
+          osrmRoute.drivingMinutes + 12 + weather.rainBufferMin + selectedService.etaOffsetMin
+        ),
         routeSource: osrmRoute.source,
         rainBufferMin: weather.rainBufferMin,
         weatherLabel: weather.labelEn
@@ -7542,6 +9127,9 @@ app.post("/api/orders/:id/send-tracking-email", optionalAuth, async (req, res) =
         riderPhone: riderRows[0]?.phone || null,
         etaMinutes: order.estimatedMinutes,
         createdAt: order.createdAt,
+        paymentSplitMode: order.paymentSplitMode,
+        onlineFoodPaidAmount: order.onlineFoodPaidAmount,
+        cashDueToRider: order.cashDueToRider,
         items: order.itemsSnapshotJson
       }),
       getEmailTransportStatus()
@@ -7570,6 +9158,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     deliveryLng: z.number(),
     deliveryInstructions: z.string().optional(),
     deliveryMode: z.enum(["platform", "restaurant", "third_party"]),
+    deliveryServiceCode: z.string().trim().max(32).optional(),
     paymentMethod: z.string().min(2).max(32),
     couponCode: z.string().optional(),
     items: z.array(
@@ -7653,7 +9242,14 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       if (subtotal < rest.minOrder) {
         throw new Error(`Minimum order for ${rest.name} is \u09F3${rest.minOrder}`);
       }
-      const provider = getDeliveryProvider(input.deliveryMode);
+      const orderSettings = await tx.select().from(platformSettings).limit(1);
+      const selectedService = selectAutoBangladeshiDeliveryService({
+        restaurantDeliveryMode: rest.deliveryMode,
+        preferredServiceCode: input.deliveryServiceCode,
+        deliveryModeOverride: input.deliveryMode,
+        pathaoEnabled: orderSettings[0]?.pathaoEnabled ?? true
+      });
+      const provider = getDeliveryProvider(selectedService.mode, selectedService.code);
       const quote = await provider.getQuote({
         orderNumber: "NEW",
         restaurantName: rest.name,
@@ -7669,8 +9265,22 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         baseFee: rest.deliveryFee,
         orderValue: subtotal
       });
+      const settings = orderSettings;
+      const serviceFee = settings[0]?.serviceFee ?? 10;
+      const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+        settings[0]?.deliveryFinancialConfig || null
+      );
+      const estRoadKm = Math.round(
+        haversineDistanceKm(rest.lat, rest.lng, input.deliveryLat, input.deliveryLng) * 1.25 * 10
+      ) / 10;
+      const zoneFeeCalc = calculateZoneDistanceDeliveryFee({
+        area: input.deliveryArea,
+        distanceKm: estRoadKm,
+        fallbackFee: quote.fee,
+        config: deliveryFinancialConfig
+      });
       let discountAmount = 0;
-      let deliveryFeeAfterCoupon = quote.fee;
+      let deliveryFeeAfterCoupon = zoneFeeCalc.deliveryFee;
       let appliedCouponCode = "";
       if (input.couponCode && input.couponCode.trim()) {
         const cRows = await tx.select().from(coupons).where(eq5(coupons.code, input.couponCode.trim().toUpperCase())).limit(1);
@@ -7689,7 +9299,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
               usageLimit: c.usageLimit
             },
             subtotal,
-            quote.fee,
+            zoneFeeCalc.deliveryFee,
             rest.id
           );
           if (evalRes.valid) {
@@ -7700,22 +9310,23 @@ app.post("/api/orders", requireAuth, async (req, res) => {
           }
         }
       }
-      const settings = await tx.select().from(platformSettings).limit(1);
-      const serviceFee = settings[0]?.serviceFee ?? 10;
-      const financials = calculateOrderFinancials({
+      const financials = calculateSplitOrderFinancials({
         subtotal,
         discountAmount,
         deliveryFee: deliveryFeeAfterCoupon,
         serviceFee,
         commissionType: rest.commissionType || "percentage",
         commissionRate: Number(rest.commissionRate) || 15,
-        fixedCommission: rest.fixedCommission || 0
+        fixedCommission: rest.fixedCommission || 0,
+        paymentMethod: normalizedMethod,
+        riderEarningRule: deliveryFinancialConfig.riderEarningRule
       });
       const orderNumber = `FD-BD-${Math.floor(1e4 + Math.random() * 89999)}`;
+      const onlineChargeAmount = financials.paymentSplitMode === "online_food_cash_delivery" ? financials.onlineFoodPayable : financials.totalPayable;
       const paymentInit = initiatePaymentSession(
         normalizedMethod,
         orderNumber,
-        financials.totalPayable,
+        onlineChargeAmount,
         matchedGateway
       );
       const deliveryDispatch = await provider.createDelivery({
@@ -7747,7 +9358,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         deliveryLat: input.deliveryLat,
         deliveryLng: input.deliveryLng,
         deliveryInstructions: input.deliveryInstructions || "",
-        deliveryMode: input.deliveryMode,
+        deliveryMode: selectedService.mode,
         deliveryProvider: deliveryDispatch.provider,
         consignmentId: deliveryDispatch.consignmentId,
         paymentMethod: normalizedMethod,
@@ -7759,19 +9370,68 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         deliveryFee: financials.deliveryFee,
         serviceFee: financials.serviceFee,
         taxAmount: financials.taxAmount,
-        totalAmount: financials.totalPayable,
+        totalAmount: financials.customerTotalCost,
         commissionRate: rest.commissionRate,
         platformCommission: financials.platformCommission,
         restaurantEarnings: financials.restaurantEarnings,
+        paymentSplitMode: financials.paymentSplitMode,
+        onlineFoodPaidAmount: financials.onlineFoodPayable,
+        cashDueToRider: financials.cashDueToRider,
+        riderEarningAmount: financials.riderEarningAmount,
+        foodoraDeliveryCommission: financials.foodoraDeliveryCommission,
+        cashCollectionStatus: financials.cashDueToRider === 0 ? "collected" : "pending",
+        cashCollectedAmount: 0,
         status: "confirmed",
         estimatedMinutes: quote.etaMinutes,
         itemsSnapshotJson: snapshotItems
       }).returning();
       const newOrder = insertedOrders[0];
+      if (financials.paymentSplitMode === "online_food_cash_delivery") {
+        await tx.insert(paymentTransactions).values([
+          {
+            orderId: newOrder.id,
+            orderNumber: newOrder.orderNumber,
+            txKind: "food_payment",
+            idempotencyKey: `food_pay:${newOrder.orderNumber}`,
+            payerRole: "customer",
+            recipientRole: "platform_restaurant",
+            paymentMethod: normalizedMethod,
+            amount: financials.onlineFoodPayable,
+            status: "pending",
+            gatewayTxId: paymentInit.transactionId,
+            note: `Online food payment via ${normalizedMethod.toUpperCase()} (excludes delivery charge)`
+          },
+          {
+            orderId: newOrder.id,
+            orderNumber: newOrder.orderNumber,
+            txKind: "delivery_cash",
+            idempotencyKey: `delivery_cash:${newOrder.orderNumber}`,
+            payerRole: "customer",
+            recipientRole: "rider",
+            paymentMethod: "cash",
+            amount: financials.cashDueToRider,
+            status: financials.cashDueToRider === 0 ? "succeeded" : "pending",
+            note: financials.cashDueToRider === 0 ? "Free delivery coupon applied (\u09F30 cash due to rider)" : `Pay cash to rider on delivery (Rider \u09F3${financials.riderEarningAmount} + Foodora commission \u09F3${financials.foodoraDeliveryCommission})`
+          }
+        ]).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+      } else {
+        await tx.insert(paymentTransactions).values({
+          orderId: newOrder.id,
+          orderNumber: newOrder.orderNumber,
+          txKind: "delivery_cash",
+          idempotencyKey: `delivery_cash:${newOrder.orderNumber}`,
+          payerRole: "customer",
+          recipientRole: "rider",
+          paymentMethod: "cod",
+          amount: financials.cashDueToRider,
+          status: "pending",
+          note: "Legacy Cash on Delivery full order collection"
+        }).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+      }
       await tx.insert(orderStatusHistory).values({
         orderId: newOrder.id,
         status: "confirmed",
-        note: `Order placed via ${input.paymentMethod.toUpperCase()} (${deliveryDispatch.provider})`,
+        note: financials.paymentSplitMode === "online_food_cash_delivery" ? `Order placed via ${input.paymentMethod.toUpperCase()} (Food Online \u09F3${financials.onlineFoodPayable} \xB7 Delivery Cash to Rider \u09F3${financials.cashDueToRider})` : `Order placed via ${input.paymentMethod.toUpperCase()} (${deliveryDispatch.provider})`,
         actorUid: req.user.uid
       });
       await tx.insert(notifications).values([
@@ -7779,7 +9439,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
           recipientUid: rest.ownerUid,
           roleTarget: "restaurant_owner",
           title: `New Order ${newOrder.orderNumber}`,
-          message: `\u09F3${newOrder.totalAmount} order from ${input.customerName} (${input.deliveryArea})`,
+          message: financials.paymentSplitMode === "online_food_cash_delivery" ? `Food \u09F3${financials.onlineFoodPayable} (${normalizedMethod.toUpperCase()} pending verify) \xB7 Delivery Cash \u09F3${financials.cashDueToRider} \xB7 ${input.deliveryArea}` : `\u09F3${newOrder.totalAmount} order from ${input.customerName} (${input.deliveryArea})`,
           type: "order",
           relatedOrderId: newOrder.id
         },
@@ -7787,7 +9447,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
           recipientUid: "role-super_admin",
           roleTarget: "super_admin",
           title: `New Order ${newOrder.orderNumber} \xB7 ${rest.name}`,
-          message: `\u09F3${newOrder.totalAmount} order from ${input.customerName} (${input.deliveryArea})`,
+          message: `Food \u09F3${financials.onlineFoodPayable} + Cash Delivery \u09F3${financials.cashDueToRider} (${input.deliveryArea})`,
           type: "order",
           relatedOrderId: newOrder.id
         },
@@ -7795,7 +9455,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
           recipientUid: req.user.uid,
           roleTarget: "customer",
           title: `Order ${newOrder.orderNumber} Confirmed`,
-          message: `Your order from ${rest.name} has been received.`,
+          message: financials.paymentSplitMode === "online_food_cash_delivery" ? `Pay food \u09F3${financials.onlineFoodPayable} online; pay \u09F3${financials.cashDueToRider} delivery cash to rider.` : `Your order from ${rest.name} has been received.`,
           type: "order",
           relatedOrderId: newOrder.id
         }
@@ -7834,6 +9494,9 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         statusNote: `Order placed via ${input.paymentMethod.toUpperCase()}`,
         etaMinutes: created.order.estimatedMinutes,
         createdAt: created.order.createdAt,
+        paymentSplitMode: created.order.paymentSplitMode,
+        onlineFoodPaidAmount: created.order.onlineFoodPaidAmount,
+        cashDueToRider: created.order.cashDueToRider,
         items: created.order.itemsSnapshotJson
       }) : Promise.resolve(null),
       getEmailTransportStatus(),
@@ -7919,10 +9582,11 @@ app.post("/api/payments/verify", requireAuth, async (req, res) => {
     const matchedGateway = gatewayRows.find(
       (g) => normalizeGatewayCode(g.code) === normalizeGatewayCode(order.paymentMethod)
     );
+    const verifyExpectedAmount = order.paymentSplitMode === "online_food_cash_delivery" && (order.onlineFoodPaidAmount || 0) > 0 ? order.onlineFoodPaidAmount : order.totalAmount;
     const verification = verifyPaymentServerSide(
       order.paymentMethod,
       parsed.data.transactionId,
-      order.totalAmount,
+      verifyExpectedAmount,
       matchedGateway
     );
     if (!verification.verified) {
@@ -7933,6 +9597,30 @@ app.post("/api/payments/verify", requireAuth, async (req, res) => {
       paymentTxId: verification.transactionId,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(eq5(orders.id, order.id)).returning();
+    const foodPayKey = `food_pay:${order.orderNumber}`;
+    const existingFoodTx = await db.select().from(paymentTransactions).where(eq5(paymentTransactions.idempotencyKey, foodPayKey)).limit(1);
+    if (existingFoodTx.length > 0) {
+      await db.update(paymentTransactions).set({
+        status: "succeeded",
+        gatewayTxId: verification.transactionId,
+        note: verification.message,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(eq5(paymentTransactions.idempotencyKey, foodPayKey));
+    } else {
+      await db.insert(paymentTransactions).values({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        txKind: "food_payment",
+        idempotencyKey: foodPayKey,
+        payerRole: "customer",
+        recipientRole: "platform_restaurant",
+        paymentMethod: order.paymentMethod,
+        amount: verifyExpectedAmount,
+        status: "succeeded",
+        gatewayTxId: verification.transactionId,
+        note: verification.message
+      }).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    }
     await db.insert(orderStatusHistory).values({
       orderId: order.id,
       status: order.status,
@@ -7970,6 +9658,9 @@ app.post("/api/payments/verify", requireAuth, async (req, res) => {
         riderName: updated[0].riderName,
         etaMinutes: updated[0].estimatedMinutes,
         createdAt: updated[0].createdAt,
+        paymentSplitMode: updated[0].paymentSplitMode,
+        onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+        cashDueToRider: updated[0].cashDueToRider,
         items: updated[0].itemsSnapshotJson
       });
     }
@@ -8025,6 +9716,31 @@ app.post("/api/payments/webhook/:code", async (req, res) => {
       paymentTxId: txId || targetOrder.paymentTxId,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(eq5(orders.id, targetOrder.id)).returning();
+    const webhookFoodKey = `food_pay:${targetOrder.orderNumber}`;
+    const existingWebhookTx = await db.select().from(paymentTransactions).where(eq5(paymentTransactions.idempotencyKey, webhookFoodKey)).limit(1);
+    const webhookTxStatus = nextPaymentStatus === "paid" ? "succeeded" : "failed";
+    if (existingWebhookTx.length > 0) {
+      await db.update(paymentTransactions).set({
+        status: webhookTxStatus,
+        gatewayTxId: txId || targetOrder.paymentTxId || "",
+        note: `Webhook (${gateway.name}) marked food payment as ${nextPaymentStatus}`,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(eq5(paymentTransactions.idempotencyKey, webhookFoodKey));
+    } else {
+      await db.insert(paymentTransactions).values({
+        orderId: targetOrder.id,
+        orderNumber: targetOrder.orderNumber,
+        txKind: "food_payment",
+        idempotencyKey: webhookFoodKey,
+        payerRole: "customer",
+        recipientRole: "platform_restaurant",
+        paymentMethod: targetOrder.paymentMethod,
+        amount: targetOrder.paymentSplitMode === "online_food_cash_delivery" ? targetOrder.onlineFoodPaidAmount || 0 : targetOrder.totalAmount,
+        status: webhookTxStatus,
+        gatewayTxId: txId || targetOrder.paymentTxId || "",
+        note: `Webhook (${gateway.name}) marked food payment as ${nextPaymentStatus}`
+      }).onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    }
     await db.insert(orderStatusHistory).values({
       orderId: targetOrder.id,
       status: targetOrder.status,
@@ -8062,6 +9778,9 @@ app.post("/api/payments/webhook/:code", async (req, res) => {
         riderName: updated[0].riderName,
         etaMinutes: updated[0].estimatedMinutes,
         createdAt: updated[0].createdAt,
+        paymentSplitMode: updated[0].paymentSplitMode,
+        onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+        cashDueToRider: updated[0].cashDueToRider,
         items: updated[0].itemsSnapshotJson
       });
     }
@@ -8302,9 +10021,9 @@ app.post(
               variationsJson: it.variationsJson,
               addonsJson: it.addonsJson,
               inStock: it.inStock,
+              isAvailable: it.isAvailable,
               isPopular: it.isPopular,
-              calories: it.calories,
-              prepTimeMin: it.prepTimeMin
+              isVisibleOnStorefront: it.isVisibleOnStorefront
             }))
           );
           copiedItemsCount = sourceItems.length;
@@ -8835,19 +10554,41 @@ app.patch(
           error: `Cannot transition order from ${order.status} to ${parsed.data.status}`
         });
       }
-      const updated = await db.update(orders).set({
-        status: parsed.data.status,
-        cancelReason: parsed.data.status === "cancelled" ? parsed.data.note || "Cancelled by restaurant" : order.cancelReason,
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(eq5(orders.id, order.id)).returning();
-      await db.insert(orderStatusHistory).values({
-        orderId: order.id,
-        status: parsed.data.status,
-        note: parsed.data.note || `Updated to ${parsed.data.status}`,
-        actorUid: req.user.uid
+      const prepaidCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentSplitMode: order.paymentSplitMode,
+        nextStatus: parsed.data.status
+      });
+      if (!prepaidCheck.allowed) {
+        return res.status(400).json({ error: prepaidCheck.reason });
+      }
+      const updated = await db.transaction(async (tx) => {
+        const nextPaymentStatus = parsed.data.status === "cancelled" ? order.paymentStatus === "paid" ? "refunded" : "failed" : order.paymentStatus;
+        const rows = await tx.update(orders).set({
+          status: parsed.data.status,
+          paymentStatus: nextPaymentStatus,
+          cancelReason: parsed.data.status === "cancelled" ? parsed.data.note || "Cancelled by restaurant" : order.cancelReason,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq5(orders.id, order.id)).returning();
+        await tx.insert(orderStatusHistory).values({
+          orderId: order.id,
+          status: parsed.data.status,
+          note: parsed.data.note || `Updated to ${parsed.data.status}`,
+          actorUid: req.user.uid
+        });
+        if (parsed.data.status === "cancelled") {
+          await reverseOrderSplitFinancialsTx(
+            tx,
+            order,
+            parsed.data.note || "Cancelled by restaurant"
+          );
+        }
+        return rows;
       });
       if (parsed.data.status === "delivered") {
         await settleOrderCommissionIdempotent(order.id);
+        await recordRiderDeliveryWalletIdempotent(order.id, void 0, req.user.uid);
       }
       await db.insert(notifications).values({
         recipientUid: order.customerUid,
@@ -8881,6 +10622,9 @@ app.patch(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: parsed.data.status,
           statusNote: parsed.data.note || `${order.restaurantName} updated order status`,
@@ -9213,6 +10957,15 @@ app.post(
           error: `Cannot assign rider to a ${order.status} order.`
         });
       }
+      const prepaidAssignCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentSplitMode: order.paymentSplitMode,
+        nextStatus: "rider_assigned"
+      });
+      if (!prepaidAssignCheck.allowed) {
+        return res.status(400).json({ error: prepaidAssignCheck.reason });
+      }
       let nextRiderUid = order.riderUid || null;
       let nextRiderName = order.riderName || null;
       let assignedRiderPhone = "";
@@ -9246,6 +10999,9 @@ app.post(
         const riderRows = await db.select().from(riders).where(eq5(riders.uid, parsed.data.riderUid)).limit(1);
         if (riderRows.length === 0) {
           return res.status(404).json({ error: "Selected rider not found" });
+        }
+        if (riderRows[0].status !== "approved") {
+          return res.status(400).json({ error: "Selected rider is pending Admin approval and cannot be assigned yet." });
         }
         nextRiderUid = riderRows[0].uid;
         nextRiderName = riderRows[0].fullName;
@@ -9310,6 +11066,9 @@ app.post(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: updated[0].status,
           statusNote,
@@ -9940,7 +11699,18 @@ app.post("/api/riders/apply", async (req, res) => {
     }
     const startLat = Number.isFinite(parsed.data.lat) ? Math.round(parsed.data.lat * 1e6) / 1e6 : 23.7949;
     const startLng = Number.isFinite(parsed.data.lng) ? Math.round(parsed.data.lng * 1e6) / 1e6 : 90.4144;
-    const inserted = await db.insert(riders).values({
+    const existingRider = await db.select().from(riders).where(eq5(riders.uid, uid)).limit(1);
+    const inserted = existingRider.length > 0 ? await db.update(riders).set({
+      fullName: parsed.data.fullName,
+      phone: parsed.data.phone,
+      email: emailLower,
+      vehicleType: parsed.data.vehicleType,
+      zone: parsed.data.zone,
+      nidNumber: parsed.data.nidNumber,
+      currentLat: startLat,
+      currentLng: startLng,
+      locationUpdatedAt: /* @__PURE__ */ new Date()
+    }).where(eq5(riders.uid, uid)).returning() : await db.insert(riders).values({
       uid,
       fullName: parsed.data.fullName,
       phone: parsed.data.phone,
@@ -9951,29 +11721,23 @@ app.post("/api/riders/apply", async (req, res) => {
       currentLat: startLat,
       currentLng: startLng,
       locationUpdatedAt: /* @__PURE__ */ new Date(),
-      isAvailable: true,
-      status: "approved"
-    }).onConflictDoUpdate({
-      target: riders.uid,
-      set: {
-        fullName: parsed.data.fullName,
-        phone: parsed.data.phone,
-        email: emailLower,
-        vehicleType: parsed.data.vehicleType,
-        zone: parsed.data.zone,
-        nidNumber: parsed.data.nidNumber,
-        currentLat: startLat,
-        currentLng: startLng,
-        locationUpdatedAt: /* @__PURE__ */ new Date(),
-        isAvailable: true,
-        status: "approved"
-      }
+      isAvailable: false,
+      status: "pending"
     }).returning();
+    const adminNotifTitle = existingRider.length > 0 ? `Rider Profile Updated \xB7 ${parsed.data.zone}` : `New Rider Application Pending Approval \xB7 ${parsed.data.zone}`;
+    const adminNotifMsg = `${parsed.data.fullName} (${parsed.data.vehicleType}) applied for ${parsed.data.zone}. Review and approve in Admin Panel.`;
     await db.insert(notifications).values({
       recipientUid: "demo-admin-uid",
       roleTarget: "super_admin",
-      title: "New Delivery Rider Joined",
-      message: `${parsed.data.fullName} (${parsed.data.vehicleType}) joined for ${parsed.data.zone}, Bangladesh.`,
+      title: adminNotifTitle,
+      message: adminNotifMsg,
+      type: "system"
+    });
+    broadcastNotificationEvent({
+      recipientUid: "role-super_admin",
+      roleTarget: "super_admin",
+      title: adminNotifTitle,
+      message: adminNotifMsg,
       type: "system"
     });
     const userPayload = {
@@ -10015,7 +11779,17 @@ app.post("/api/riders/register", requireAuth, async (req, res) => {
   try {
     const startLat = Number.isFinite(parsed.data.lat) ? Math.round(parsed.data.lat * 1e6) / 1e6 : 23.7949;
     const startLng = Number.isFinite(parsed.data.lng) ? Math.round(parsed.data.lng * 1e6) / 1e6 : 90.4144;
-    const inserted = await db.insert(riders).values({
+    const existingRider = await db.select().from(riders).where(eq5(riders.uid, req.user.uid)).limit(1);
+    const inserted = existingRider.length > 0 ? await db.update(riders).set({
+      fullName: parsed.data.fullName,
+      phone: parsed.data.phone,
+      vehicleType: parsed.data.vehicleType,
+      zone: parsed.data.zone,
+      nidNumber: parsed.data.nidNumber,
+      currentLat: startLat,
+      currentLng: startLng,
+      locationUpdatedAt: /* @__PURE__ */ new Date()
+    }).where(eq5(riders.uid, req.user.uid)).returning() : await db.insert(riders).values({
       uid: req.user.uid,
       fullName: parsed.data.fullName,
       phone: parsed.data.phone,
@@ -10026,21 +11800,25 @@ app.post("/api/riders/register", requireAuth, async (req, res) => {
       currentLat: startLat,
       currentLng: startLng,
       locationUpdatedAt: /* @__PURE__ */ new Date(),
-      isAvailable: true,
-      status: "approved"
-    }).onConflictDoUpdate({
-      target: riders.uid,
-      set: {
-        fullName: parsed.data.fullName,
-        phone: parsed.data.phone,
-        vehicleType: parsed.data.vehicleType,
-        zone: parsed.data.zone,
-        nidNumber: parsed.data.nidNumber,
-        currentLat: startLat,
-        currentLng: startLng,
-        locationUpdatedAt: /* @__PURE__ */ new Date()
-      }
+      isAvailable: false,
+      status: "pending"
     }).returning();
+    if (existingRider.length === 0) {
+      await db.insert(notifications).values({
+        recipientUid: "demo-admin-uid",
+        roleTarget: "super_admin",
+        title: `New Rider Application Pending Approval \xB7 ${parsed.data.zone}`,
+        message: `${parsed.data.fullName} (${parsed.data.vehicleType}) applied for ${parsed.data.zone}.`,
+        type: "system"
+      });
+      broadcastNotificationEvent({
+        recipientUid: "role-super_admin",
+        roleTarget: "super_admin",
+        title: `New Rider Application Pending Approval \xB7 ${parsed.data.zone}`,
+        message: `${parsed.data.fullName} (${parsed.data.vehicleType}) applied for ${parsed.data.zone}.`,
+        type: "system"
+      });
+    }
     let nextUser = req.user;
     if (req.user.role === "customer") {
       await db.update(users).set({ role: "rider", fullName: parsed.data.fullName }).where(eq5(users.uid, req.user.uid));
@@ -10220,7 +11998,39 @@ app.post(
       if (existingOrder.riderUid && existingOrder.riderUid !== riderUid) {
         return res.status(409).json({ error: "Order has already been claimed by another rider." });
       }
+      const prepaidRiderCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: existingOrder.paymentMethod,
+        paymentStatus: existingOrder.paymentStatus,
+        paymentSplitMode: existingOrder.paymentSplitMode,
+        nextStatus: "rider_assigned"
+      });
+      if (!prepaidRiderCheck.allowed) {
+        return res.status(400).json({ error: prepaidRiderCheck.reason });
+      }
       const riderRows = await db.select().from(riders).where(eq5(riders.uid, riderUid)).limit(1);
+      const isAdminCaller = req.user.role === "super_admin" || req.user.role === "admin";
+      if (!isAdminCaller) {
+        const settingsRows = await db.select().from(platformSettings).limit(1);
+        const financialConfig = mergeDeliveryFinancialConfig(settingsRows[0]?.deliveryFinancialConfig);
+        const ledgerRows = await db.select().from(riderWalletLedger).where(eq5(riderWalletLedger.riderUid, riderUid));
+        const walletSummary = summarizeRiderWalletLedger(
+          ledgerRows.map((e) => ({
+            entryType: e.entryType,
+            cashCollected: e.cashCollected,
+            riderEarningDelta: e.riderEarningDelta,
+            commissionOwedDelta: e.commissionOwedDelta,
+            commissionSettledDelta: e.commissionSettledDelta
+          }))
+        );
+        const riderAcceptCheck = canRiderAcceptOrders({
+          riderStatus: riderRows[0]?.status,
+          outstandingCommission: walletSummary.outstandingCommission,
+          settlementRules: financialConfig.settlementRules
+        });
+        if (!riderAcceptCheck.allowed) {
+          return res.status(403).json({ error: riderAcceptCheck.reason });
+        }
+      }
       const riderName = riderRows[0]?.fullName || req.user.fullName;
       const updated = await db.update(orders).set({
         riderUid,
@@ -10267,6 +12077,9 @@ app.post(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: "rider_assigned",
           statusNote: `Rider ${riderName} accepted delivery assignment`,
@@ -10362,6 +12175,15 @@ app.patch(
       if (!allowAssignedPickup && !canTransitionOrderStatus(order.status, parsed.data.status)) {
         return res.status(400).json({ error: `Cannot change order from ${order.status} to ${parsed.data.status}` });
       }
+      const prepaidCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentSplitMode: order.paymentSplitMode,
+        nextStatus: parsed.data.status
+      });
+      if (!prepaidCheck.allowed) {
+        return res.status(400).json({ error: prepaidCheck.reason });
+      }
       const updated = await db.update(orders).set({
         status: parsed.data.status,
         paymentStatus: parsed.data.status === "delivered" && order.paymentMethod === "cod" ? "paid" : order.paymentStatus,
@@ -10395,12 +12217,11 @@ app.patch(
       });
       if (parsed.data.status === "delivered") {
         await settleOrderCommissionIdempotent(order.id);
-        if (order.riderUid) {
-          await db.update(riders).set({
-            totalDeliveries: sql3`${riders.totalDeliveries} + 1`,
-            totalEarnings: sql3`${riders.totalEarnings} + ${Math.max(40, order.deliveryFee)}`
-          }).where(eq5(riders.uid, order.riderUid));
-        }
+        await recordRiderDeliveryWalletIdempotent(
+          order.id,
+          parsed.data.collectedCashAmount,
+          req.user.uid
+        );
       }
       const restOwnerRows = await db.select({ ownerUid: restaurants.ownerUid, email: restaurants.email }).from(restaurants).where(eq5(restaurants.id, updated[0].restaurantId)).limit(1);
       const riderStatusRecipient = await resolveCustomerEmailForOrder(
@@ -10428,6 +12249,9 @@ app.patch(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: parsed.data.status,
           statusNote: statusLabels[parsed.data.status] || "Delivery Update",
@@ -10880,21 +12704,34 @@ app.patch(
           nextRiderName = riderRows[0]?.fullName || parsed.data.riderUid;
         }
       }
-      const updated = await db.update(orders).set({
-        status: parsed.data.status,
-        riderUid: nextRiderUid,
-        riderName: nextRiderName,
-        paymentStatus: parsed.data.status === "delivered" && order.paymentMethod === "cod" ? "paid" : order.paymentStatus,
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(eq5(orders.id, orderId)).returning();
-      await db.insert(orderStatusHistory).values({
-        orderId,
-        status: parsed.data.status,
-        note: parsed.data.note || `Admin updated status to ${parsed.data.status.replace(/_/g, " ")}`,
-        actorUid: req.user.uid
+      const updated = await db.transaction(async (tx) => {
+        const nextPaymentStatus = parsed.data.status === "delivered" && order.paymentMethod === "cod" ? "paid" : parsed.data.status === "cancelled" ? order.paymentStatus === "paid" ? "refunded" : "failed" : order.paymentStatus;
+        const rows2 = await tx.update(orders).set({
+          status: parsed.data.status,
+          riderUid: nextRiderUid,
+          riderName: nextRiderName,
+          paymentStatus: nextPaymentStatus,
+          cancelReason: parsed.data.status === "cancelled" ? parsed.data.note || "Cancelled by Admin" : order.cancelReason,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq5(orders.id, orderId)).returning();
+        await tx.insert(orderStatusHistory).values({
+          orderId,
+          status: parsed.data.status,
+          note: parsed.data.note || `Admin updated status to ${parsed.data.status.replace(/_/g, " ")}`,
+          actorUid: req.user.uid
+        });
+        if (parsed.data.status === "cancelled") {
+          await reverseOrderSplitFinancialsTx(
+            tx,
+            order,
+            parsed.data.note || "Cancelled by Admin"
+          );
+        }
+        return rows2;
       });
       if (parsed.data.status === "delivered") {
         await settleOrderCommissionIdempotent(orderId);
+        await recordRiderDeliveryWalletIdempotent(orderId, void 0, req.user.uid);
       }
       await db.insert(auditLogs).values({
         actorUid: req.user.uid,
@@ -10929,6 +12766,9 @@ app.patch(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: parsed.data.status,
           statusNote: parsed.data.note || `Order update: ${parsed.data.status.replace(/_/g, " ")}`,
@@ -11039,6 +12879,11 @@ app.patch(
           note: "Order cancelled and commission reversed by Super Admin",
           actorUid: req.user.uid
         });
+        await reverseOrderSplitFinancialsTx(
+          tx,
+          order,
+          req.body.reason || "Cancelled & refunded by Super Admin"
+        );
         await tx.insert(auditLogs).values({
           actorUid: req.user.uid,
           action: "order_refund",
@@ -11073,6 +12918,9 @@ app.patch(
           totalAmount: result.totalAmount,
           paymentMethod: result.paymentMethod,
           paymentStatus: result.paymentStatus,
+          paymentSplitMode: result.paymentSplitMode,
+          onlineFoodPaidAmount: result.onlineFoodPaidAmount,
+          cashDueToRider: result.cashDueToRider,
           status: result.status,
           statusEvent: "cancelled",
           statusNote: result.cancelReason || "Order cancelled & refunded by Admin",
@@ -11343,15 +13191,35 @@ app.patch(
       if (existing.length === 0) return res.status(404).json({ error: "Rider not found" });
       const cur = existing[0];
       const hasCoords = typeof parsed.data.currentLat === "number" || typeof parsed.data.currentLng === "number";
+      const nextStatus = parsed.data.status ?? cur.status;
+      const nextIsAvailable = typeof parsed.data.isAvailable === "boolean" ? parsed.data.isAvailable : parsed.data.status === "approved" && cur.status === "pending" ? true : parsed.data.status === "suspended" ? false : cur.isAvailable;
       const updated = await db.update(riders).set({
-        status: parsed.data.status ?? cur.status,
-        isAvailable: typeof parsed.data.isAvailable === "boolean" ? parsed.data.isAvailable : cur.isAvailable,
+        status: nextStatus,
+        isAvailable: nextIsAvailable,
         zone: parsed.data.zone ? parsed.data.zone : cur.zone,
         vehicleType: parsed.data.vehicleType ? parsed.data.vehicleType : cur.vehicleType,
         currentLat: typeof parsed.data.currentLat === "number" ? Math.round(parsed.data.currentLat * 1e6) / 1e6 : cur.currentLat,
         currentLng: typeof parsed.data.currentLng === "number" ? Math.round(parsed.data.currentLng * 1e6) / 1e6 : cur.currentLng,
         locationUpdatedAt: hasCoords ? /* @__PURE__ */ new Date() : cur.locationUpdatedAt
       }).where(eq5(riders.id, id)).returning();
+      if (parsed.data.status && parsed.data.status !== cur.status) {
+        const statusTitle = parsed.data.status === "approved" ? `Rider Account Approved \xB7 ${updated[0].zone}` : parsed.data.status === "suspended" ? "Rider Account Suspended" : "Rider Status Set to Pending";
+        const statusMsg = parsed.data.status === "approved" ? `Welcome! You are now approved to accept deliveries in ${updated[0].zone}.` : parsed.data.status === "suspended" ? "Your rider dispatch access has been suspended by Admin." : "Your rider application is under Admin review.";
+        await db.insert(notifications).values({
+          recipientUid: updated[0].uid,
+          roleTarget: "rider",
+          title: statusTitle,
+          message: statusMsg,
+          type: "system"
+        });
+        broadcastNotificationEvent({
+          recipientUid: updated[0].uid,
+          roleTarget: "rider",
+          title: statusTitle,
+          message: statusMsg,
+          type: "system"
+        });
+      }
       await db.insert(auditLogs).values({
         actorUid: req.user.uid,
         action: hasCoords ? "rider_gps_override" : "rider_updated",
@@ -11362,6 +13230,154 @@ app.patch(
       res.json({ rider: updated[0] });
     } catch (error) {
       res.status(500).json({ error: error.message });
+    }
+  }
+);
+app.patch(
+  "/api/admin/delivery-financial-config",
+  requireAuth,
+  requireRole(["admin", "super_admin"]),
+  async (req, res) => {
+    try {
+      const existing = await db.select().from(platformSettings).limit(1);
+      if (existing.length === 0) return res.status(404).json({ error: "Platform settings missing" });
+      const cur = existing[0];
+      const currentMerged = mergeDeliveryFinancialConfig(cur.deliveryFinancialConfig);
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      const nextConfig = mergeDeliveryFinancialConfig({
+        zoneFees: { ...currentMerged.zoneFees, ...body.zoneFees || {} },
+        distancePricing: { ...currentMerged.distancePricing, ...body.distancePricing || {} },
+        riderEarningRule: { ...currentMerged.riderEarningRule, ...body.riderEarningRule || {} },
+        settlementRules: { ...currentMerged.settlementRules, ...body.settlementRules || {} }
+      });
+      await db.update(platformSettings).set({
+        deliveryFinancialConfig: nextConfig,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(eq5(platformSettings.id, cur.id));
+      await db.insert(auditLogs).values({
+        actorUid: req.user.uid,
+        action: "delivery_financial_config_updated",
+        targetType: "platform_settings",
+        targetId: String(cur.id),
+        details: JSON.stringify(nextConfig)
+      });
+      res.json({ deliveryFinancialConfig: nextConfig });
+    } catch (error) {
+      res.status(500).json({ error: error.message || "Failed to update delivery financial config" });
+    }
+  }
+);
+app.post(
+  "/api/admin/riders/:uid/settle-commission",
+  requireAuth,
+  requireRole(["admin", "super_admin"]),
+  async (req, res) => {
+    const riderUid = String(req.params.uid || "").trim();
+    const schema = z.object({
+      amount: z.number().int().positive(),
+      method: z.string().trim().min(2).max(40).default("cash"),
+      referenceId: z.string().trim().max(80).optional(),
+      note: z.string().trim().max(240).optional()
+    });
+    const parsed = schema.safeParse(req.body || {});
+    if (!riderUid || !parsed.success) {
+      return res.status(400).json({ error: "Valid positive settlement amount required" });
+    }
+    try {
+      const riderRows = await db.select().from(riders).where(eq5(riders.uid, riderUid)).limit(1);
+      if (riderRows.length === 0) return res.status(404).json({ error: "Rider not found" });
+      const existingEntries = await db.select().from(riderWalletLedger).where(eq5(riderWalletLedger.riderUid, riderUid));
+      const summaryBefore = summarizeRiderWalletLedger(
+        existingEntries.map((e) => ({
+          entryType: e.entryType,
+          cashCollected: e.cashCollected,
+          riderEarningDelta: e.riderEarningDelta,
+          commissionOwedDelta: e.commissionOwedDelta,
+          commissionSettledDelta: e.commissionSettledDelta
+        }))
+      );
+      if (summaryBefore.outstandingCommission <= 0) {
+        return res.status(400).json({ error: "This rider has no outstanding Foodora commission owed." });
+      }
+      if (parsed.data.amount > summaryBefore.outstandingCommission) {
+        return res.status(400).json({
+          error: `Settlement amount (\u09F3${parsed.data.amount}) exceeds outstanding commission owed (\u09F3${summaryBefore.outstandingCommission}).`
+        });
+      }
+      const ref = parsed.data.referenceId?.trim() || `STL-${Date.now().toString(36).toUpperCase()}-${crypto4.randomBytes(2).toString("hex").toUpperCase()}`;
+      const idempotencyKey = `settle:${riderUid}:${Date.now()}:${crypto4.randomBytes(4).toString("hex")}`;
+      const inserted = await db.insert(riderWalletLedger).values({
+        riderUid,
+        orderId: null,
+        orderNumber: "",
+        entryType: "commission_settled",
+        idempotencyKey,
+        cashCollected: 0,
+        riderEarningDelta: 0,
+        commissionOwedDelta: 0,
+        commissionSettledDelta: parsed.data.amount,
+        referenceId: ref,
+        note: parsed.data.note?.trim() || `Commission settled (${parsed.data.method}) \xB7 Recorded by Admin`
+      }).returning();
+      await db.insert(notifications).values({
+        recipientUid: riderUid,
+        roleTarget: "rider",
+        title: `Commission Settled \xB7 \u09F3${parsed.data.amount}`,
+        message: `Admin recorded your Foodora commission settlement of \u09F3${parsed.data.amount} (${ref}).`,
+        type: "system"
+      });
+      broadcastNotificationEvent({
+        recipientUid: riderUid,
+        roleTarget: "rider",
+        title: `Commission Settled \xB7 \u09F3${parsed.data.amount}`,
+        message: `Admin recorded your Foodora commission settlement of \u09F3${parsed.data.amount} (${ref}).`,
+        type: "system"
+      });
+      await db.insert(auditLogs).values({
+        actorUid: req.user.uid,
+        action: "rider_commission_settled",
+        targetType: "rider",
+        targetId: riderUid,
+        details: JSON.stringify({ amount: parsed.data.amount, method: parsed.data.method, referenceId: ref })
+      });
+      const updatedSummary = summarizeRiderWalletLedger([
+        ...existingEntries.map((e) => ({
+          entryType: e.entryType,
+          cashCollected: e.cashCollected,
+          riderEarningDelta: e.riderEarningDelta,
+          commissionOwedDelta: e.commissionOwedDelta,
+          commissionSettledDelta: e.commissionSettledDelta
+        })),
+        {
+          entryType: "commission_settled",
+          cashCollected: 0,
+          riderEarningDelta: 0,
+          commissionOwedDelta: 0,
+          commissionSettledDelta: parsed.data.amount
+        }
+      ]);
+      res.status(201).json({
+        entry: inserted[0],
+        walletSummary: updatedSummary
+      });
+    } catch (error) {
+      res.status(500).json({ error: error.message || "Failed to settle rider commission" });
+    }
+  }
+);
+app.get(
+  "/api/admin/transactions",
+  requireAuth,
+  requireRole(["admin", "super_admin"]),
+  async (_req, res) => {
+    try {
+      const [txRows, walletRows] = await Promise.all([
+        db.select().from(paymentTransactions).orderBy(desc3(paymentTransactions.id)).limit(250),
+        db.select().from(riderWalletLedger).orderBy(desc3(riderWalletLedger.id)).limit(250)
+      ]);
+      res.json({ paymentTransactions: txRows, riderWalletLedger: walletRows });
+    } catch (error) {
+      res.status(500).json({ error: error.message || "Failed to load financial transactions" });
     }
   }
 );
@@ -12009,13 +14025,51 @@ app.post("/api/notifications/:id/read", requireAuth, async (req, res) => {
 function getGeminiApiKey() {
   return (process.env.GEMINI_API_KEY || process.env.AI_STUDIO_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY || "").trim();
 }
-function getOpenRouterApiKey() {
-  return (process.env.OPENROUTER_API_KEY || "").trim();
+function getProviderEnvApiKey(providerType) {
+  switch (providerType) {
+    case "openrouter":
+      return (process.env.OPENROUTER_API_KEY || "").trim();
+    case "openai":
+      return (process.env.OPENAI_API_KEY || "").trim();
+    case "groq":
+      return (process.env.GROQ_API_KEY || "").trim();
+    case "deepseek":
+      return (process.env.DEEPSEEK_API_KEY || "").trim();
+    case "anthropic":
+      return (process.env.ANTHROPIC_API_KEY || "").trim();
+    case "mistral":
+      return (process.env.MISTRAL_API_KEY || "").trim();
+    case "xai":
+      return (process.env.XAI_API_KEY || "").trim();
+    case "together":
+      return (process.env.TOGETHER_API_KEY || "").trim();
+    case "cerebras":
+      return (process.env.CEREBRAS_API_KEY || "").trim();
+    case "perplexity":
+      return (process.env.PERPLEXITY_API_KEY || "").trim();
+    case "cohere":
+      return (process.env.COHERE_API_KEY || "").trim();
+    case "huggingface":
+      return (process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN || "").trim();
+    default:
+      return "";
+  }
 }
 function getAiEnvFlags() {
   return {
     hasGeminiKey: Boolean(getGeminiApiKey()),
-    hasOpenRouterKey: Boolean(getOpenRouterApiKey())
+    hasOpenRouterKey: Boolean(getProviderEnvApiKey("openrouter")),
+    hasOpenAIKey: Boolean(getProviderEnvApiKey("openai")),
+    hasGroqKey: Boolean(getProviderEnvApiKey("groq")),
+    hasDeepSeekKey: Boolean(getProviderEnvApiKey("deepseek")),
+    hasAnthropicKey: Boolean(getProviderEnvApiKey("anthropic")),
+    hasMistralKey: Boolean(getProviderEnvApiKey("mistral")),
+    hasXaiKey: Boolean(getProviderEnvApiKey("xai")),
+    hasTogetherKey: Boolean(getProviderEnvApiKey("together")),
+    hasCerebrasKey: Boolean(getProviderEnvApiKey("cerebras")),
+    hasPerplexityKey: Boolean(getProviderEnvApiKey("perplexity")),
+    hasCohereKey: Boolean(getProviderEnvApiKey("cohere")),
+    hasHuggingFaceKey: Boolean(getProviderEnvApiKey("huggingface"))
   };
 }
 function getGeminiHelpClient() {
@@ -12050,21 +14104,21 @@ var aiHelpRequestSchema = z.object({
 });
 function extractReadableGeminiError(err) {
   const rawStatus = typeof err?.status === "number" ? err.status : 502;
-  const rawMsg = err instanceof Error ? err.message : "Failed to generate AI Help response.";
+  const rawMsg = coerceSafeErrorText(err, "Failed to generate AI Help response.");
   let parsedMessage = rawMsg;
   let parsedStatus = rawStatus;
   if (rawMsg.trim().startsWith("{")) {
     try {
       const obj = JSON.parse(rawMsg);
-      if (obj.error?.message) parsedMessage = obj.error.message;
-      else if (obj.message) parsedMessage = obj.message;
+      const candidate = coerceSafeErrorText(obj.error?.message ?? obj.message, "");
+      if (candidate) parsedMessage = candidate;
       if (typeof obj.error?.code === "number") parsedStatus = obj.error.code;
     } catch {
     }
   }
   return {
     status: parsedStatus >= 400 && parsedStatus < 600 ? parsedStatus : 502,
-    message: parsedMessage
+    message: coerceSafeErrorText(parsedMessage, "Failed to generate AI Help response.")
   };
 }
 function withTimeout(promise, ms, label) {
@@ -12087,12 +14141,57 @@ function withTimeout(promise, ms, label) {
   });
 }
 function resolveDefaultBaseUrlForAiType(providerType) {
+  if (providerType === "pollinations") return "https://text.pollinations.ai";
   if (providerType === "openrouter") return "https://openrouter.ai/api/v1";
   if (providerType === "openai") return "https://api.openai.com/v1";
   if (providerType === "groq") return "https://api.groq.com/openai/v1";
   if (providerType === "deepseek") return "https://api.deepseek.com/v1";
   if (providerType === "anthropic") return "https://api.anthropic.com";
+  if (providerType === "mistral") return "https://api.mistral.ai/v1";
+  if (providerType === "xai") return "https://api.x.ai/v1";
+  if (providerType === "together") return "https://api.together.xyz/v1";
+  if (providerType === "cerebras") return "https://api.cerebras.ai/v1";
+  if (providerType === "perplexity") return "https://api.perplexity.ai";
+  if (providerType === "cohere") return "https://api.cohere.com/compatibility/v1";
+  if (providerType === "huggingface") return "https://router.huggingface.co/v1";
   return "";
+}
+async function runSingleOpenRouterRequest(options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+  try {
+    const res = await fetch(`${options.baseUrl}/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${options.apiKey}`,
+        "HTTP-Referer": options.refererOrigin || "https://foodorabd-3-nine.vercel.app",
+        "X-Title": "Foodora BD"
+      },
+      body: JSON.stringify(options.payload)
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const errMsg = coerceSafeErrorText(json?.error?.message ?? json?.error, `OpenRouter API failed (${res.status})`);
+      const err = new Error(errMsg);
+      err.status = res.status;
+      throw err;
+    }
+    const msg = json?.choices?.[0]?.message;
+    const text2 = extractAiReplyText(msg?.content);
+    if (!text2) {
+      const err = new Error("OpenRouter returned an empty response.");
+      err.status = 502;
+      throw err;
+    }
+    return {
+      reply: text2,
+      reasoningDetails: msg?.reasoning_details
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 async function callExternalAiProvider(options) {
   const baseUrl = (options.apiBaseUrl || resolveDefaultBaseUrlForAiType(options.providerType)).trim().replace(/\/+$/, "");
@@ -12101,8 +14200,88 @@ async function callExternalAiProvider(options) {
     err.status = 400;
     throw err;
   }
+  if (options.providerType === "pollinations") {
+    const controller2 = new AbortController();
+    const timer2 = setTimeout(() => controller2.abort(), 18e3);
+    try {
+      const endpoint = baseUrl.endsWith("/openai") ? baseUrl : `${baseUrl}/openai`;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        signal: controller2.signal,
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: options.model || "openai-fast",
+          messages: [
+            { role: "system", content: options.systemInstruction },
+            ...options.history.slice(-6).map((h) => ({
+              role: h.role === "model" ? "assistant" : "user",
+              content: h.text
+            })),
+            { role: "user", content: options.message }
+          ]
+        })
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const err = new Error(coerceSafeErrorText(json?.error?.message ?? json?.error, `Pollinations AI failed (${res.status})`));
+        err.status = res.status;
+        throw err;
+      }
+      const text2 = extractAiReplyText(json?.choices?.[0]?.message?.content);
+      if (!text2) throw new Error("Pollinations AI returned an empty response.");
+      return { reply: text2, actualModel: options.model || "openai-fast" };
+    } finally {
+      clearTimeout(timer2);
+    }
+  }
+  if (options.providerType === "openrouter") {
+    const primaryModel = (options.model || "").trim() || "google/gemma-4-31b-it:free";
+    const attempts = [
+      { model: primaryModel, strictProvider: true, enableReasoning: true },
+      { model: primaryModel, strictProvider: false, enableReasoning: false }
+    ];
+    for (const fallbackModel of [
+      "google/gemma-3-27b-it:free",
+      "meta-llama/llama-3.3-70b-instruct:free",
+      "openrouter/free"
+    ]) {
+      if (fallbackModel !== primaryModel) {
+        attempts.push({ model: fallbackModel, strictProvider: false, enableReasoning: false });
+      }
+    }
+    let lastErr = null;
+    for (const attempt of attempts) {
+      try {
+        const payload = buildOpenRouterChatPayload({
+          model: attempt.model,
+          systemInstruction: options.systemInstruction,
+          history: options.history,
+          message: options.message,
+          strictProvider: attempt.strictProvider,
+          enableReasoning: attempt.enableReasoning
+        });
+        const out = await runSingleOpenRouterRequest({
+          baseUrl,
+          apiKey: options.apiKey,
+          refererOrigin: options.refererOrigin,
+          payload,
+          timeoutMs: 18e3
+        });
+        return { ...out, actualModel: attempt.model };
+      } catch (err) {
+        lastErr = err;
+        const status = err?.status;
+        if (status === 401 || status === 403) {
+          throw err;
+        }
+      }
+    }
+    throw lastErr || new Error("OpenRouter API failed.");
+  }
   const controller = new AbortController();
-  const timeoutMs = options.providerType === "openrouter" ? 25e3 : 15e3;
+  const timeoutMs = 15e3;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     if (options.providerType === "anthropic") {
@@ -12129,45 +14308,13 @@ async function callExternalAiProvider(options) {
       });
       const json2 = await res2.json().catch(() => ({}));
       if (!res2.ok) {
-        const err = new Error(json2?.error?.message || `Anthropic API failed (${res2.status})`);
+        const err = new Error(coerceSafeErrorText(json2?.error?.message ?? json2?.error, `Anthropic API failed (${res2.status})`));
         err.status = res2.status;
         throw err;
       }
-      const text3 = (json2?.content?.[0]?.text || "").trim();
+      const text3 = extractAiReplyText(json2?.content);
       if (!text3) throw new Error("Anthropic returned an empty response.");
-      return { reply: text3 };
-    }
-    if (options.providerType === "openrouter") {
-      const payload = buildOpenRouterChatPayload({
-        model: options.model,
-        systemInstruction: options.systemInstruction,
-        history: options.history,
-        message: options.message
-      });
-      const res2 = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${options.apiKey}`,
-          "HTTP-Referer": options.refererOrigin || "https://foodorabd-3-nine.vercel.app",
-          "X-Title": "Foodora BD"
-        },
-        body: JSON.stringify(payload)
-      });
-      const json2 = await res2.json().catch(() => ({}));
-      if (!res2.ok) {
-        const err = new Error(json2?.error?.message || `OpenRouter API failed (${res2.status})`);
-        err.status = res2.status;
-        throw err;
-      }
-      const msg = json2?.choices?.[0]?.message;
-      const text3 = (msg?.content || "").trim();
-      if (!text3) throw new Error("OpenRouter returned an empty response.");
-      return {
-        reply: text3,
-        reasoningDetails: msg?.reasoning_details
-      };
+      return { reply: text3, actualModel: options.model };
     }
     const res = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
@@ -12192,13 +14339,13 @@ async function callExternalAiProvider(options) {
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const err = new Error(json?.error?.message || `AI API failed (${res.status})`);
+      const err = new Error(coerceSafeErrorText(json?.error?.message ?? json?.error, `AI API failed (${res.status})`));
       err.status = res.status;
       throw err;
     }
-    const text2 = (json?.choices?.[0]?.message?.content || "").trim();
+    const text2 = extractAiReplyText(json?.choices?.[0]?.message?.content);
     if (!text2) throw new Error("AI API returned an empty response.");
-    return { reply: text2 };
+    return { reply: text2, actualModel: options.model };
   } finally {
     clearTimeout(timer);
   }
@@ -12240,12 +14387,20 @@ app.put(
       name: z.string().trim().min(2).max(80),
       providerType: z.enum([
         "foodora",
+        "pollinations",
         "gemini",
         "openrouter",
         "openai",
         "groq",
         "deepseek",
         "anthropic",
+        "mistral",
+        "xai",
+        "together",
+        "cerebras",
+        "perplexity",
+        "cohere",
+        "huggingface",
         "custom_openai"
       ]),
       model: z.string().trim().min(2).max(100),
@@ -12266,6 +14421,7 @@ app.put(
       return res.status(400).json({ error: "Provider code must be at least 2 characters." });
     }
     const isBuiltinNoExternalUrl = parsed.data.providerType === "gemini" || parsed.data.providerType === "foodora";
+    const isKeylessProvider = isBuiltinNoExternalUrl || parsed.data.providerType === "pollinations";
     const resolvedBaseUrl = isBuiltinNoExternalUrl ? "" : parsed.data.apiBaseUrl || resolveDefaultBaseUrlForAiType(parsed.data.providerType);
     if (!isBuiltinNoExternalUrl && resolvedBaseUrl) {
       if (!isValidExternalAiBaseUrl(resolvedBaseUrl)) {
@@ -12279,7 +14435,7 @@ app.put(
       const existing = await db.select().from(aiProviders).where(eq5(aiProviders.code, code)).limit(1);
       const cur = existing[0];
       let nextApiKey = "";
-      if (!isBuiltinNoExternalUrl) {
+      if (!isKeylessProvider) {
         const incoming = parsed.data.apiKey;
         if (incoming === void 0) {
           nextApiKey = cur?.apiKey || "";
@@ -12346,16 +14502,16 @@ app.post(
           try {
             const resp = await withTimeout(
               ai.models.generateContent({
-                model: "gemini-2.5-flash",
+                model: "gemini-4-hydrogen",
                 contents: [{ role: "user", parts: [{ text: "Reply strictly with: OK" }] }]
               }),
               7e3,
-              "gemini-2.5-flash"
+              "gemini-4-hydrogen"
             );
             if ((resp.text || "").trim()) {
               return res.json({
                 ok: true,
-                message: "Foodora Own AI connected cleanly (Gemini + Built-in Knowledge Engine).",
+                message: "Foodora Own AI connected cleanly (Gemini 4 + Built-in Knowledge Engine).",
                 model: row.model
               });
             }
@@ -12368,6 +14524,22 @@ app.post(
           model: row.model
         });
       }
+      if (row.providerType === "pollinations") {
+        const { reply: reply2, actualModel: actualModel2 } = await callExternalAiProvider({
+          providerType: "pollinations",
+          model: row.model || "openai-fast",
+          apiBaseUrl: row.apiBaseUrl || "https://text.pollinations.ai",
+          apiKey: "",
+          systemInstruction: "Reply strictly with OK.",
+          history: [],
+          message: "Reply strictly with: OK"
+        });
+        return res.json({
+          ok: Boolean(reply2),
+          message: `Connected cleanly to Pollinations Free AI (${actualModel2 || row.model}).`,
+          model: actualModel2 || row.model
+        });
+      }
       if (row.providerType === "gemini") {
         const ai = getGeminiHelpClient();
         if (!ai) {
@@ -12377,7 +14549,7 @@ app.post(
             model: row.model
           });
         }
-        const testModel = row.model || "gemini-2.5-flash";
+        const testModel = row.model || "gemini-4-hydrogen";
         const resp = await withTimeout(
           ai.models.generateContent({
             model: testModel,
@@ -12392,7 +14564,7 @@ app.post(
           model: testModel
         });
       }
-      const resolvedKey = (row.apiKey || "").trim() || (row.providerType === "openrouter" ? getOpenRouterApiKey() : "");
+      const resolvedKey = (row.apiKey || "").trim() || getProviderEnvApiKey(row.providerType);
       if (!resolvedKey) {
         return res.json({
           ok: false,
@@ -12400,7 +14572,7 @@ app.post(
           model: row.model
         });
       }
-      const { reply } = await callExternalAiProvider({
+      const { reply, actualModel } = await callExternalAiProvider({
         providerType: row.providerType,
         model: row.model,
         apiBaseUrl: row.apiBaseUrl || "",
@@ -12412,8 +14584,8 @@ app.post(
       });
       return res.json({
         ok: Boolean(reply),
-        message: `Connected cleanly to ${row.name} (${row.model}).`,
-        model: row.model
+        message: `Connected cleanly to ${row.name} (${actualModel || row.model}).`,
+        model: actualModel || row.model
       });
     } catch (error) {
       const { message } = extractReadableGeminiError(error);
@@ -12468,25 +14640,22 @@ async function runGeminiHelpCompletion(params) {
       parts: [{ text: params.message }]
     }
   ];
-  const candidateModels = Array.from(
-    new Set(
-      [params.preferredModel, "gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-4-hydrogen"].filter(
-        (m) => Boolean(m && m.trim() && m !== "foodora-bd-assistant")
-      )
-    )
-  );
+  const candidateModels = filterGeminiCandidateModels(params.preferredModel);
   let lastError = null;
   for (let i = 0; i < candidateModels.length; i += 1) {
     const modelName = candidateModels[i];
     try {
+      const config = {
+        systemInstruction: params.systemInstruction
+      };
+      if (modelName.startsWith("gemini-4")) {
+        config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+      }
       const response = await withTimeout(
         ai.models.generateContent({
           model: modelName,
           contents,
-          config: {
-            systemInstruction: params.systemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
-          }
+          config
         }),
         9e3,
         modelName
@@ -12527,7 +14696,7 @@ app.post("/api/ai/help", optionalAuth, async (req, res) => {
     const activeProviders = allProviders.filter((p) => p.isActive);
     const envFlags = getAiEnvFlags();
     const normalizedRequestedCode = providerCode ? normalizeAiProviderCode(providerCode) : "";
-    const chosenProvider = (normalizedRequestedCode ? activeProviders.find((p) => normalizeAiProviderCode(p.code) === normalizedRequestedCode) : void 0) || activeProviders.find((p) => p.isDefault && toPublicAiProviderView(p, envFlags).isConfigured) || activeProviders.find((p) => toPublicAiProviderView(p, envFlags).isConfigured) || activeProviders.find((p) => p.providerType === "foodora") || activeProviders.find((p) => p.providerType === "gemini") || allProviders[0];
+    const chosenProvider = (normalizedRequestedCode ? activeProviders.find((p) => normalizeAiProviderCode(p.code) === normalizedRequestedCode) : void 0) || activeProviders.find((p) => p.isDefault && toPublicAiProviderView(p, envFlags).isConfigured) || activeProviders.find((p) => toPublicAiProviderView(p, envFlags).isConfigured) || activeProviders.find((p) => p.providerType === "foodora") || activeProviders.find((p) => p.providerType === "pollinations") || allProviders[0];
     const chosenType = chosenProvider?.providerType || "foodora";
     if (chosenType === "foodora") {
       const openRestaurants = await getApprovedRestaurants().catch(() => []);
@@ -12537,7 +14706,7 @@ app.post("/api/ai/help", optionalAuth, async (req, res) => {
           const enrichedInstruction = liveRestLine ? `${systemInstruction}
 Live Open Restaurants: ${liveRestLine}` : systemInstruction;
           const geminiOut2 = await runGeminiHelpCompletion({
-            preferredModel: "gemini-2.5-flash",
+            preferredModel: "gemini-4-hydrogen",
             systemInstruction: enrichedInstruction,
             history,
             message
@@ -12566,11 +14735,44 @@ Live Open Restaurants: ${liveRestLine}` : systemInstruction;
         providerName: chosenProvider?.name || "Foodora Own AI"
       });
     }
+    if (chosenType === "pollinations") {
+      const extRes = await callExternalAiProvider({
+        providerType: "pollinations",
+        model: chosenProvider?.model || "openai-fast",
+        apiBaseUrl: chosenProvider?.apiBaseUrl || "https://text.pollinations.ai",
+        apiKey: "",
+        systemInstruction,
+        history,
+        message,
+        refererOrigin: getRequestOrigin(req)
+      });
+      return res.json({
+        reply: extRes.reply,
+        model: extRes.actualModel || chosenProvider?.model || "openai-fast",
+        providerCode: chosenProvider?.code || "pollinations",
+        providerName: chosenProvider?.name || "Pollinations Free AI"
+      });
+    }
     if (chosenProvider && chosenType !== "gemini") {
-      const apiKey = (chosenProvider.apiKey || "").trim() || (chosenType === "openrouter" ? getOpenRouterApiKey() : "");
+      const apiKey = (chosenProvider.apiKey || "").trim() || getProviderEnvApiKey(chosenType);
+      if (!apiKey && chosenType === "openrouter" && envFlags.hasGeminiKey) {
+        const geminiOut2 = await runGeminiHelpCompletion({
+          preferredModel: "gemini-4-hydrogen",
+          systemInstruction,
+          history,
+          message
+        });
+        return res.json({
+          reply: geminiOut2.reply,
+          model: geminiOut2.model,
+          providerCode: chosenProvider.code,
+          providerName: `${chosenProvider.name} (Gemini 4 Route)`
+        });
+      }
       if (!apiKey) {
         return res.status(503).json({
-          error: `${chosenProvider.name} API key is not configured yet in Super Admin > Backend Control.`
+          error: `${chosenProvider.name} requires an API key in Super Admin > Backend Control. Switch to Foodora Own AI or Pollinations Free AI to chat instantly.`,
+          suggestedFallback: "foodora"
         });
       }
       const extRes = await callExternalAiProvider({
@@ -12585,7 +14787,7 @@ Live Open Restaurants: ${liveRestLine}` : systemInstruction;
       });
       return res.json({
         reply: extRes.reply,
-        model: chosenProvider.model,
+        model: extRes.actualModel || chosenProvider.model,
         providerCode: chosenProvider.code,
         providerName: chosenProvider.name,
         ...extRes.reasoningDetails !== void 0 ? { reasoningDetails: extRes.reasoningDetails } : {}
@@ -12593,11 +14795,12 @@ Live Open Restaurants: ${liveRestLine}` : systemInstruction;
     }
     if (!envFlags.hasGeminiKey) {
       return res.status(503).json({
-        error: "Google Gemini requires GEMINI_API_KEY in Settings > Secrets, or switch AI Engine to Foodora Own AI / OpenRouter."
+        error: "Google Gemini requires GEMINI_API_KEY in Settings > Secrets, or switch AI Engine to Foodora Own AI / Pollinations Free AI.",
+        suggestedFallback: "foodora"
       });
     }
     const geminiOut = await runGeminiHelpCompletion({
-      preferredModel: chosenProvider?.model?.trim() || "gemini-2.5-flash",
+      preferredModel: chosenProvider?.model?.trim() || "gemini-4-hydrogen",
       systemInstruction,
       history,
       message
@@ -12606,13 +14809,14 @@ Live Open Restaurants: ${liveRestLine}` : systemInstruction;
       reply: geminiOut.reply,
       model: geminiOut.model,
       providerCode: chosenProvider?.code || "gemini",
-      providerName: chosenProvider?.name || "Google Gemini"
+      providerName: chosenProvider?.name || "Google Gemini 4"
     });
   } catch (err) {
     const { status, message } = extractReadableGeminiError(err);
     console.error("POST /api/ai/help error:", message);
     return res.status(status).json({
-      error: message
+      error: message,
+      suggestedFallback: "foodora"
     });
   }
 });

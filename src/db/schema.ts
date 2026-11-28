@@ -199,6 +199,14 @@ export const orders = pgTable('orders', {
   riderUid: text('rider_uid').default(''),
   riderName: text('rider_name').default(''),
   estimatedMinutes: integer('estimated_minutes').notNull().default(30),
+  paymentSplitMode: text('payment_split_mode').notNull().default('online_food_cash_delivery'),
+  onlineFoodPaidAmount: integer('online_food_paid_amount').notNull().default(0),
+  cashDueToRider: integer('cash_due_to_rider').notNull().default(0),
+  riderEarningAmount: integer('rider_earning_amount').notNull().default(0),
+  foodoraDeliveryCommission: integer('foodora_delivery_commission').notNull().default(0),
+  cashCollectionStatus: text('cash_collection_status').notNull().default('pending'), // pending | collected | reversed
+  cashCollectedAmount: integer('cash_collected_amount').notNull().default(0),
+  cashCollectedAt: timestamp('cash_collected_at'),
   itemsSnapshotJson: jsonb('items_snapshot_json')
     .$type<
       Array<{
@@ -347,6 +355,7 @@ export const platformSettings = pgTable('platform_settings', {
   sslcommerzEnabled: boolean('sslcommerz_enabled').notNull().default(true),
   sslcommerzSandbox: boolean('sslcommerz_sandbox').notNull().default(true),
   storefrontConfig: jsonb('storefront_config').$type<Record<string, unknown>>().notNull().default({}),
+  deliveryFinancialConfig: jsonb('delivery_financial_config').$type<Record<string, unknown>>().notNull().default({}),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 
@@ -431,4 +440,41 @@ export const aiProviders = pgTable('ai_providers', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
+
+export const paymentTransactions = pgTable('payment_transactions', {
+  id: serial('id').primaryKey(),
+  orderId: integer('order_id')
+    .references(() => orders.id, { onDelete: 'cascade' })
+    .notNull(),
+  orderNumber: text('order_number').notNull(),
+  txKind: text('tx_kind').notNull(), // food_payment | delivery_cash | food_refund | delivery_reversal | rider_commission_settlement
+  idempotencyKey: text('idempotency_key').notNull().unique(),
+  payerRole: text('payer_role').notNull().default('customer'), // customer | rider | platform
+  recipientRole: text('recipient_role').notNull().default('platform_restaurant'), // platform_restaurant | rider | foodora | customer
+  paymentMethod: text('payment_method').notNull().default('bkash'),
+  amount: integer('amount').notNull().default(0),
+  status: text('status').notNull().default('pending'), // pending | succeeded | failed | refunded | cancelled
+  gatewayTxId: text('gateway_tx_id').default(''),
+  riderUid: text('rider_uid').default(''),
+  note: text('note').default(''),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const riderWalletLedger = pgTable('rider_wallet_ledger', {
+  id: serial('id').primaryKey(),
+  riderUid: text('rider_uid').notNull(),
+  orderId: integer('order_id').references(() => orders.id, { onDelete: 'set null' }),
+  orderNumber: text('order_number').notNull().default(''),
+  entryType: text('entry_type').notNull(), // delivery_earning | commission_owed | commission_settled | commission_reversal
+  idempotencyKey: text('idempotency_key').notNull().unique(),
+  cashCollected: integer('cash_collected').notNull().default(0),
+  riderEarningDelta: integer('rider_earning_delta').notNull().default(0),
+  commissionOwedDelta: integer('commission_owed_delta').notNull().default(0),
+  commissionSettledDelta: integer('commission_settled_delta').notNull().default(0),
+  referenceId: text('reference_id').default(''),
+  note: text('note').default(''),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
 

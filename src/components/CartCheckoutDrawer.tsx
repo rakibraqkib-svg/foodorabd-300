@@ -15,25 +15,38 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import {
+  BANGLADESH_DELIVERY_SERVICES,
+  type BangladeshDeliveryServiceCode,
   buildRestaurantUnavailableMessage,
   calculateCartItemUnitPrice,
   calculateCartSubtotal,
-  calculateOrderFinancials,
+  calculateSplitOrderFinancials,
   type CartItemInput,
   convertBdtToCurrency,
+  DEFAULT_DELIVERY_FINANCIAL_CONFIG,
   DEFAULT_PAYMENT_GATEWAYS,
+  type DeliveryFinancialConfig,
   type DeliveryMode,
   formatBdt,
+  formatDurationEstimate,
   formatResolvedMapAddress,
+  getBangladeshDeliveryServiceMeta,
   isGatewaySelectableAtCheckout,
+  matchDhakaDeliveryZone,
   type PaymentMethod,
+  selectAutoBangladeshiDeliveryService,
   toPublicPaymentGatewayView,
 } from '../lib/marketplace-logic';
 import { BANGLADESH_AREAS, getBangladeshAreaSelectPresets } from '../lib/i18n';
 import { AddressSearchInput, saveRecentAddress } from './AddressSearchInput';
 import { DhakaMapPicker } from './DhakaMapPicker';
 import { SelectWithCustom } from './SelectWithCustom';
-import type { Lang, PublicPaymentGateway, Restaurant } from '../types/marketplace';
+import type {
+  DhakaZoneCoverageItem,
+  Lang,
+  PublicPaymentGateway,
+  Restaurant,
+} from '../types/marketplace';
 
 interface CartCheckoutDrawerProps {
   open: boolean;
@@ -44,6 +57,8 @@ interface CartCheckoutDrawerProps {
   lang: Lang;
   mapsApiKey: string;
   paymentGateways?: PublicPaymentGateway[];
+  deliveryFinancialConfig?: DeliveryFinancialConfig | null;
+  dhakaZoneCoverage?: DhakaZoneCoverageItem[];
   selectedArea: { name: string; lat: number; lng: number; displayName?: string };
   customerName: string;
   customerEmail?: string;
@@ -117,6 +132,8 @@ export function CartCheckoutDrawer({
   lang,
   mapsApiKey,
   paymentGateways,
+  deliveryFinancialConfig,
+  dhakaZoneCoverage,
   selectedArea,
   customerName,
   customerEmail,
@@ -146,9 +163,12 @@ export function CartCheckoutDrawer({
         ? paymentGateways
         : DEFAULT_PAYMENT_GATEWAYS.map((g) => toPublicPaymentGatewayView(g, false));
     const filtered = source.filter(isGatewaySelectableAtCheckout);
-    return filtered.length > 0
-      ? filtered
-      : DEFAULT_PAYMENT_GATEWAYS.map((g) => toPublicPaymentGatewayView(g, false));
+    const selectable =
+      filtered.length > 0
+        ? filtered
+        : DEFAULT_PAYMENT_GATEWAYS.map((g) => toPublicPaymentGatewayView(g, false));
+    const onlineOnly = selectable.filter((g) => g.code !== 'cod');
+    return onlineOnly.length > 0 ? onlineOnly : selectable;
   }, [paymentGateways]);
 
   const [step, setStep] = useState<'cart' | 'checkout'>('cart');
@@ -175,7 +195,16 @@ export function CartCheckoutDrawer({
   );
   const [coords, setCoords] = useState({ lat: selectedArea.lat, lng: selectedArea.lng });
   const [instructions, setInstructions] = useState('');
-  const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>(restaurant?.deliveryMode || 'platform');
+  const [deliveryServiceCode, setDeliveryServiceCode] = useState<BangladeshDeliveryServiceCode>(() =>
+    selectAutoBangladeshiDeliveryService({
+      restaurantDeliveryMode: restaurant?.deliveryMode || 'third_party',
+    }).code
+  );
+  const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>(() =>
+    selectAutoBangladeshiDeliveryService({
+      restaurantDeliveryMode: restaurant?.deliveryMode || 'third_party',
+    }).mode
+  );
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>(() => activeGateways[0]?.code || 'bkash');
   const [quoteFee, setQuoteFee] = useState<number>(restaurant?.deliveryFee ?? 49);
   const [quoteEta, setQuoteEta] = useState<number>(restaurant?.deliveryTimeMin ?? 25);
@@ -187,7 +216,7 @@ export function CartCheckoutDrawer({
 
   useEffect(() => {
     if (!activeGateways.some((g) => g.code === paymentMethod)) {
-      setPaymentMethod(activeGateways[0]?.code || 'cod');
+      setPaymentMethod(activeGateways[0]?.code || 'bkash');
     }
   }, [activeGateways, paymentMethod]);
 
@@ -215,9 +244,13 @@ export function CartCheckoutDrawer({
 
   useEffect(() => {
     if (restaurant) {
-      setDeliveryMode(restaurant.deliveryMode || 'platform');
-      setQuoteFee(restaurant.deliveryFee ?? 49);
-      setQuoteEta(restaurant.deliveryTimeMin ?? 25);
+      const autoService = selectAutoBangladeshiDeliveryService({
+        restaurantDeliveryMode: restaurant.deliveryMode,
+      });
+      setDeliveryServiceCode(autoService.code);
+      setDeliveryMode(autoService.mode);
+      setQuoteFee(Math.max(autoService.minBaseFee, restaurant.deliveryFee ?? 49));
+      setQuoteEta((restaurant.deliveryTimeMin ?? 25) + autoService.etaOffsetMin);
       setAppliedCoupon(null);
       setCouponError(null);
     }
@@ -251,6 +284,7 @@ export function CartCheckoutDrawer({
         distanceKm?: number;
         weatherLabel?: string;
         rainBufferMin?: number;
+        serviceCode?: BangladeshDeliveryServiceCode;
       };
     }>('/api/delivery/quote', {
       method: 'POST',
@@ -258,7 +292,9 @@ export function CartCheckoutDrawer({
         restaurantId: restaurant.id,
         dropoffLat: coords.lat,
         dropoffLng: coords.lng,
+        dropoffArea: area,
         deliveryMode,
+        deliveryServiceCode,
       }),
     })
       .then((res) => {
@@ -268,15 +304,17 @@ export function CartCheckoutDrawer({
         setQuoteWeather(res.quote.weatherLabel || '');
       })
       .catch(() => {
-        setQuoteFee(restaurant.deliveryFee);
+        const meta = getBangladeshDeliveryServiceMeta(deliveryServiceCode);
+        setQuoteFee(Math.max(meta.minBaseFee, restaurant.deliveryFee));
       });
-  }, [restaurant, coords.lat, coords.lng, deliveryMode]);
+  }, [restaurant, coords.lat, coords.lng, area, deliveryMode, deliveryServiceCode]);
 
   if (!open) return null;
 
   const subtotal = calculateCartSubtotal(cartItems);
   const effectiveDeliveryFee = appliedCoupon?.freeDelivery ? 0 : quoteFee;
-  const financials = calculateOrderFinancials({
+  const activeFinancialConfig = deliveryFinancialConfig || DEFAULT_DELIVERY_FINANCIAL_CONFIG;
+  const financials = calculateSplitOrderFinancials({
     subtotal,
     discountAmount: appliedCoupon?.discountAmount ?? 0,
     deliveryFee: effectiveDeliveryFee,
@@ -284,7 +322,13 @@ export function CartCheckoutDrawer({
     commissionType: primaryRestaurant?.commissionType || 'percentage',
     commissionRate: Number(primaryRestaurant?.commissionRate ?? 15),
     fixedCommission: primaryRestaurant?.fixedCommission ?? 0,
+    paymentMethod,
+    riderEarningRule: activeFinancialConfig.riderEarningRule,
   });
+  const matchedAreaZone = matchDhakaDeliveryZone(area);
+  const matchedZoneCoverage = matchedAreaZone
+    ? dhakaZoneCoverage?.find((z) => z.zoneCode === matchedAreaZone.code) || null
+    : null;
 
   const handleApplyCoupon = async () => {
     if (!primaryRestaurant || !couponInput.trim()) return;
@@ -362,7 +406,8 @@ export function CartCheckoutDrawer({
             deliveryLat: coords.lat,
             deliveryLng: coords.lng,
             deliveryInstructions: instructions,
-            deliveryMode: currentRest?.deliveryMode || deliveryMode,
+            deliveryMode,
+            deliveryServiceCode,
             paymentMethod,
             couponCode: appliedCoupon?.code || '',
             items: items.map((i) => ({
@@ -582,8 +627,47 @@ export function CartCheckoutDrawer({
             </div>
 
             <div className="p-4 border-t border-neutral-200 bg-neutral-50 space-y-2 text-sm tabular-nums">
+              {/* Auto-Added Bangladeshi Delivery Service (Pathao Food / Steadfast / RedX / Foodora Fleet) */}
+              <div
+                data-testid="cart-auto-delivery-box"
+                className="p-2.5 rounded-xl bg-white border border-neutral-200 space-y-1.5"
+              >
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="inline-flex items-center gap-1.5 font-bold text-[#2E3138]">
+                    <Truck className="w-3.5 h-3.5 text-[#E21B70]" />
+                    <span>
+                      {lang === 'bn' ? 'ডেলিভারি সার্ভিস (স্বয়ংক্রিয়ভাবে যুক্ত)' : 'Delivery Service (Auto-Added)'}
+                    </span>
+                  </span>
+                  <span className="text-[11px] font-semibold text-emerald-700">
+                    ~{formatDurationEstimate(quoteEta, lang, 'compact')}
+                  </span>
+                </div>
+                <select
+                  aria-label="Cart Bangladeshi delivery service"
+                  value={deliveryServiceCode}
+                  onChange={(e) => {
+                    const nextMeta = getBangladeshDeliveryServiceMeta(e.target.value);
+                    setDeliveryServiceCode(nextMeta.code);
+                    setDeliveryMode(nextMeta.mode);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 bg-neutral-50 text-xs font-semibold text-[#2E3138]"
+                >
+                  {BANGLADESH_DELIVERY_SERVICES.map((svc) => (
+                    <option key={svc.code} value={svc.code}>
+                      {lang === 'bn' ? svc.nameBn : svc.nameEn}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-neutral-500">
+                  {lang === 'bn'
+                    ? getBangladeshDeliveryServiceMeta(deliveryServiceCode).coverageNoteBn
+                    : getBangladeshDeliveryServiceMeta(deliveryServiceCode).coverageNoteEn}
+                </p>
+              </div>
+
               <div className="flex justify-between text-neutral-600">
-                <span>{lang === 'bn' ? 'সাবটোটাল' : 'Subtotal'}</span>
+                <span>{lang === 'bn' ? 'খাবারের মূল্য (সাবটোটাল)' : 'Food Price (Subtotal)'}</span>
                 <span>{formatBdt(financials.subtotal, lang)}</span>
               </div>
               {financials.discountAmount > 0 && (
@@ -593,20 +677,50 @@ export function CartCheckoutDrawer({
                 </div>
               )}
               <div className="flex justify-between text-neutral-600">
-                <span>{lang === 'bn' ? 'ডেলিভারি ফি' : 'Delivery Fee'}</span>
-                <span>{formatBdt(financials.deliveryFee, lang)}</span>
-              </div>
-              <div className="flex justify-between text-neutral-600">
                 <span>{lang === 'bn' ? 'সার্ভিস চার্জ' : 'Service Fee'}</span>
                 <span>{formatBdt(financials.serviceFee, lang)}</span>
               </div>
-              <div className="flex justify-between font-bold text-base text-[#2E3138] pt-2 border-t border-neutral-200">
-                <span>{lang === 'bn' ? 'সর্বমোট' : 'Total Payable'}</span>
-                <div className="text-right">
-                  <span className="text-[#E21B70]">{formatBdt(financials.totalPayable, lang)}</span>
-                  <p className="text-[11px] font-medium text-neutral-500">
-                    ≈ ${convertBdtToCurrency(financials.totalPayable, usdRate).toFixed(2)} USD
-                  </p>
+              <div className="flex justify-between text-neutral-600">
+                <span>
+                  {lang === 'bn'
+                    ? `ডেলিভারি চার্জ (${getBangladeshDeliveryServiceMeta(deliveryServiceCode).nameBn})`
+                    : `Delivery Charge (${getBangladeshDeliveryServiceMeta(deliveryServiceCode).nameEn})`}
+                </span>
+                <span>{formatBdt(financials.deliveryFee, lang)}</span>
+              </div>
+
+              <div
+                data-testid="cart-split-payment-breakdown"
+                className="rounded-xl border border-neutral-200 bg-white p-2.5 space-y-1.5 text-xs"
+              >
+                <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900">
+                  <span className="font-semibold">
+                    {lang === 'bn'
+                      ? 'অনলাইনে পেমেন্ট (শুধু খাবার)'
+                      : 'Online Food Payment (Excl. Delivery)'}
+                  </span>
+                  <span className="font-bold tabular-nums">
+                    {formatBdt(financials.onlineFoodPayable, lang)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-amber-50 border border-amber-200 text-amber-900">
+                  <span className="font-semibold">
+                    {lang === 'bn'
+                      ? 'রাইডারকে নগদ দিন (ডেলিভারি)'
+                      : 'Cash to Rider (Delivery Charge)'}
+                  </span>
+                  <span className="font-bold tabular-nums">
+                    {formatBdt(financials.cashDueToRider, lang)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between pt-1 px-1 font-bold text-sm text-[#2E3138]">
+                  <span>{lang === 'bn' ? 'গ্রাহকের মোট খরচ' : 'Customer Total Cost'}</span>
+                  <div className="text-right tabular-nums">
+                    <span className="text-[#E21B70]">{formatBdt(financials.customerTotalCost, lang)}</span>
+                    <span className="ml-1.5 text-[10px] font-medium text-neutral-500">
+                      ≈ ${convertBdtToCurrency(financials.customerTotalCost, usdRate).toFixed(2)} USD
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -840,6 +954,38 @@ export function CartCheckoutDrawer({
                     }
                   }}
                 />
+                {matchedAreaZone && (
+                  <div
+                    data-testid="checkout-dhaka-zone-coverage"
+                    className={`mt-1.5 px-2.5 py-1.5 rounded-lg border text-[11px] flex items-center justify-between gap-2 ${
+                      matchedZoneCoverage?.hasActiveCoverage
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                        : 'bg-amber-50 border-amber-200 text-amber-900'
+                    }`}
+                  >
+                    <span className="font-semibold">
+                      {matchedAreaZone.code} ·{' '}
+                      {lang === 'bn' ? matchedAreaZone.nameBn : matchedAreaZone.name}
+                    </span>
+                    <span className="font-medium tabular-nums">
+                      {matchedZoneCoverage
+                        ? matchedZoneCoverage.onlineCount > 0
+                          ? lang === 'bn'
+                            ? `${matchedZoneCoverage.onlineCount} জন রাইডার অনলাইন`
+                            : `${matchedZoneCoverage.onlineCount} online riders`
+                          : matchedZoneCoverage.approvedCount > 0
+                          ? lang === 'bn'
+                            ? `${matchedZoneCoverage.approvedCount} জন অনুমোদিত রাইডার`
+                            : `${matchedZoneCoverage.approvedCount} approved riders`
+                          : lang === 'bn'
+                          ? 'রাইডার অনুমোদনের অপেক্ষায়'
+                          : 'Zone riders pending admin approval'
+                        : lang === 'bn'
+                        ? 'ঢাকা জোন ডেলিভারি'
+                        : 'Dhaka zone pricing active'}
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div>
@@ -901,7 +1047,10 @@ export function CartCheckoutDrawer({
                     primaryRestaurant ? { lat: primaryRestaurant.lat, lng: primaryRestaurant.lng, label: primaryRestaurant.name } : undefined
                   }
                   interactive
-                  heightClass="h-[180px]"
+                  showTraffic
+                  showDirectionsSummary
+                  enableInteractivePointRoute={!primaryRestaurant}
+                  heightClass={primaryRestaurant ? 'h-[220px]' : 'h-[210px]'}
                   onSelectLocation={(c) => {
                     setCoords({ lat: c.lat, lng: c.lng });
                     if (c.areaName) {
@@ -922,24 +1071,34 @@ export function CartCheckoutDrawer({
 
               <div>
                 <label className="block text-xs font-semibold text-neutral-700 mb-1.5">
-                  {lang === 'bn' ? 'ডেলিভারি সিস্টেম' : 'Delivery Provider'}
+                  {lang === 'bn'
+                    ? 'বাংলাদেশী ডেলিভারি সার্ভিস (পাঠাও ফুড ও অন্যান্য কুরিয়ার)'
+                    : 'Bangladeshi Delivery Service (Pathao Food & Couriers)'}
                 </label>
                 <div className="grid grid-cols-3 gap-2">
                   {[
-                    { id: 'platform' as const, label: 'Foodora Rider', icon: Bike },
-                    { id: 'third_party' as const, label: 'Pathao Courier', icon: Truck },
-                    { id: 'restaurant' as const, label: 'Restaurant', icon: Store },
+                    { code: 'pathao_food' as const, label: 'Pathao Food', icon: Truck },
+                    { code: 'foodora_express' as const, label: 'Foodora Rider', icon: Bike },
+                    { code: 'steadfast' as const, label: 'Steadfast BD', icon: Truck },
+                    { code: 'redx' as const, label: 'RedX BD', icon: Truck },
+                    { code: 'paperfly' as const, label: 'Paperfly BD', icon: Truck },
+                    { code: 'restaurant_fleet' as const, label: 'Restaurant', icon: Store },
                   ].map((opt) => {
                     const Icon = opt.icon;
+                    const active = deliveryServiceCode === opt.code;
                     return (
                       <button
-                        key={opt.id}
+                        key={opt.code}
                         type="button"
-                        onClick={() => setDeliveryMode(opt.id)}
-                        className={`p-2.5 rounded-xl border text-center text-xs font-semibold flex flex-col items-center gap-1 ${
-                          deliveryMode === opt.id
+                        onClick={() => {
+                          const meta = getBangladeshDeliveryServiceMeta(opt.code);
+                          setDeliveryServiceCode(meta.code);
+                          setDeliveryMode(meta.mode);
+                        }}
+                        className={`p-2 rounded-xl border text-center text-[11px] font-semibold flex flex-col items-center gap-1 ${
+                          active
                             ? 'border-[#E21B70] bg-[#FFF0F6] text-[#E21B70]'
-                            : 'border-neutral-200 text-neutral-700'
+                            : 'border-neutral-200 text-neutral-700 hover:border-neutral-300'
                         }`}
                       >
                         <Icon className="w-4 h-4" />
@@ -949,7 +1108,8 @@ export function CartCheckoutDrawer({
                   })}
                 </div>
                 <p className="text-[11px] text-neutral-500 mt-1.5 tabular-nums">
-                  {lang === 'bn' ? 'আনুমানিক সময়:' : 'Estimated arrival:'} ~{quoteEta} mins
+                  {getBangladeshDeliveryServiceMeta(deliveryServiceCode).nameEn} ·{' '}
+                  {lang === 'bn' ? 'আনুমানিক সময়:' : 'Estimated arrival:'} ~{formatDurationEstimate(quoteEta, lang)}
                   {quoteDistanceKm !== null ? ` · ${quoteDistanceKm.toFixed(1)} km road route` : ''}
                   {quoteWeather ? ` · ${quoteWeather}` : ''} · {formatBdt(effectiveDeliveryFee, lang)}
                 </p>
@@ -957,7 +1117,9 @@ export function CartCheckoutDrawer({
 
               <div>
                 <label className="block text-xs font-semibold text-neutral-700 mb-1.5">
-                  {lang === 'bn' ? 'পেমেন্ট পদ্ধতি' : 'Payment Method'}
+                  {lang === 'bn'
+                    ? 'অনলাইন ফুড পেমেন্ট পদ্ধতি (শুধুমাত্র খাবারের দাম)'
+                    : 'Online Food Payment Method (Food Price Only)'}
                 </label>
                 <div className="grid grid-cols-2 gap-2">
                   {activeGateways.map((pm) => {
@@ -998,6 +1160,52 @@ export function CartCheckoutDrawer({
                     <p className="text-[11px] text-neutral-500 mt-1.5">{chosen.instructions}</p>
                   ) : null;
                 })()}
+
+                <div
+                  data-testid="checkout-split-payment-card"
+                  className="mt-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3 space-y-2 text-xs"
+                >
+                  <div className="flex items-center justify-between px-2.5 py-2 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900">
+                    <div>
+                      <p className="font-bold">
+                        {lang === 'bn' ? 'অনলাইনে পরিশোধ (খাবার)' : 'Online Paid (Food Price)'}
+                      </p>
+                      <p className="text-[10px] text-emerald-700">
+                        {lang === 'bn'
+                          ? 'ডেলিভারি চার্জ বাদে · গেটওয়ে যাচাইকৃত'
+                          : 'Excludes delivery fee · Verified before kitchen prep'}
+                      </p>
+                    </div>
+                    <span className="font-bold text-sm tabular-nums">
+                      {formatBdt(financials.onlineFoodPayable, lang)}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between px-2.5 py-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-900">
+                    <div>
+                      <p className="font-bold">
+                        {lang === 'bn'
+                          ? 'রাইডারকে নগদ দিন (ডেলিভারি চার্জ)'
+                          : 'Pay Cash to Rider (Delivery Charge)'}
+                      </p>
+                      <p className="text-[10px] text-amber-800">
+                        {lang === 'bn'
+                          ? 'ডেলিভারির সময় রাইডারের হাতে সরাসরি দেবেন'
+                          : 'Paid directly in cash to rider upon delivery'}
+                      </p>
+                    </div>
+                    <span className="font-bold text-sm tabular-nums">
+                      {formatBdt(financials.cashDueToRider, lang)}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-1 border-t border-neutral-200 font-bold text-sm text-[#2E3138]">
+                    <span>{lang === 'bn' ? 'গ্রাহকের মোট খরচ' : 'Customer Total Cost'}</span>
+                    <span className="text-[#E21B70] tabular-nums">
+                      {formatBdt(financials.customerTotalCost, lang)}
+                    </span>
+                  </div>
+                </div>
               </div>
 
               <div>
@@ -1023,14 +1231,16 @@ export function CartCheckoutDrawer({
               <div className="flex items-center justify-between text-xs text-neutral-500 mb-2">
                 <span className="inline-flex items-center gap-1">
                   <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                  {lang === 'bn' ? 'সার্ভার-যাচাইকৃত নিরাপদ পেমেন্ট' : 'Server-verified checkout'}
+                  {lang === 'bn'
+                    ? `এখন অনলাইনে: ${formatBdt(financials.onlineFoodPayable, lang)} · রাইডারকে ক্যাশ: ${formatBdt(financials.cashDueToRider, lang)}`
+                    : `Online now: ${formatBdt(financials.onlineFoodPayable, lang)} · Cash to rider: ${formatBdt(financials.cashDueToRider, lang)}`}
                 </span>
                 <div className="text-right tabular-nums">
                   <span className="font-bold text-sm text-[#2E3138]">
-                    {formatBdt(financials.totalPayable, lang)}
+                    {formatBdt(financials.customerTotalCost, lang)}
                   </span>
                   <span className="ml-1.5 text-[11px] text-neutral-400">
-                    (${convertBdtToCurrency(financials.totalPayable, usdRate).toFixed(2)})
+                    (${convertBdtToCurrency(financials.customerTotalCost, usdRate).toFixed(2)})
                   </span>
                 </div>
               </div>
@@ -1049,8 +1259,8 @@ export function CartCheckoutDrawer({
                     ? 'অর্ডার প্রসেস হচ্ছে...'
                     : 'Placing Order...'
                   : lang === 'bn'
-                  ? 'অর্ডার নিশ্চিত করুন'
-                  : 'Place Order Now'}
+                  ? `অনলাইনে ${formatBdt(financials.onlineFoodPayable, lang)} পে করুন · রাইডারকে ${formatBdt(financials.cashDueToRider, lang)} ক্যাশ`
+                  : `Pay ${formatBdt(financials.onlineFoodPayable, lang)} Online · ${formatBdt(financials.cashDueToRider, lang)} Cash to Rider`}
               </button>
             </div>
           </form>

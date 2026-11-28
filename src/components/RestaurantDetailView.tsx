@@ -4,6 +4,7 @@ import {
   buildRestaurantUnavailableMessage,
   calculateCartItemUnitPrice,
   formatBdt,
+  formatDurationEstimate,
   type CartAddon,
   type CartItemInput,
 } from '../lib/marketplace-logic';
@@ -16,6 +17,7 @@ interface RestaurantDetailViewProps {
   reviews: ReviewItem[];
   lang: Lang;
   mapsApiKey: string;
+  selectedArea?: { name: string; nameBn?: string; lat: number; lng: number };
   isFavorited: boolean;
   onToggleFavorite: (restaurantId: number) => void;
   onAddToCart: (item: CartItemInput) => void;
@@ -28,6 +30,7 @@ export function RestaurantDetailView({
   reviews,
   lang,
   mapsApiKey,
+  selectedArea,
   isFavorited,
   onToggleFavorite,
   onAddToCart,
@@ -36,6 +39,7 @@ export function RestaurantDetailView({
   const [menuSearch, setMenuSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [activeFood, setActiveFood] = useState<FoodItem | null>(null);
+  const [routeSwapped, setRouteSwapped] = useState(false);
 
   // Customization modal state
   const [selectedVariation, setSelectedVariation] = useState<string>('');
@@ -176,7 +180,7 @@ export function RestaurantDetailView({
                 <span aria-hidden="true">·</span>
                 <span className="inline-flex items-center gap-1">
                   <Clock className="w-4 h-4 text-neutral-500" />
-                  {restaurant.deliveryTimeMin} {lang === 'bn' ? 'মিনিট' : 'mins'}
+                  {formatDurationEstimate(restaurant.deliveryTimeMin, lang)}
                 </span>
                 <span aria-hidden="true">·</span>
                 <span>
@@ -344,11 +348,43 @@ export function RestaurantDetailView({
             <DhakaMapPicker
               mapsApiKey={mapsApiKey}
               lang={lang}
-              center={{ lat: restaurant.lat, lng: restaurant.lng }}
-              markerLabel={restaurant.name}
-              pinType="vendor"
+              center={
+                routeSwapped && selectedArea
+                  ? { lat: selectedArea.lat, lng: selectedArea.lng }
+                  : { lat: restaurant.lat, lng: restaurant.lng }
+              }
+              markerLabel={
+                routeSwapped && selectedArea
+                  ? lang === 'bn'
+                    ? selectedArea.nameBn || selectedArea.name
+                    : selectedArea.name
+                  : lang === 'bn'
+                  ? restaurant.nameBn || restaurant.name
+                  : restaurant.name
+              }
+              originPoint={
+                selectedArea
+                  ? routeSwapped
+                    ? {
+                        lat: restaurant.lat,
+                        lng: restaurant.lng,
+                        label: lang === 'bn' ? restaurant.nameBn || restaurant.name : restaurant.name,
+                      }
+                    : {
+                        lat: selectedArea.lat,
+                        lng: selectedArea.lng,
+                        label: lang === 'bn' ? selectedArea.nameBn || selectedArea.name : selectedArea.name,
+                      }
+                  : undefined
+              }
+              onSwapInteractiveRoute={
+                selectedArea ? () => setRouteSwapped((prev) => !prev) : undefined
+              }
+              pinType={routeSwapped ? 'user' : 'vendor'}
               restaurantName={restaurant.name}
-              heightClass="h-[220px]"
+              showTraffic
+              showDirectionsSummary
+              heightClass="h-[240px]"
             />
             <p className="text-xs text-neutral-500 mt-2.5">{restaurant.address}</p>
           </div>

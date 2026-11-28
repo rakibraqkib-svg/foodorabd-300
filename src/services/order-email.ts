@@ -1080,6 +1080,9 @@ export async function sendAndLogOrderTrackingEmail(params: {
   riderPhone?: string | null;
   etaMinutes?: number | null;
   createdAt?: string | Date | null;
+  paymentSplitMode?: string | null;
+  onlineFoodPaidAmount?: number | null;
+  cashDueToRider?: number | null;
   items?: Array<{
     foodItemId?: number;
     name: string;
@@ -1124,6 +1127,9 @@ export async function sendAndLogOrderTrackingEmail(params: {
     riderPhone: params.riderPhone,
     etaMinutes: params.etaMinutes,
     createdAt: params.createdAt,
+    paymentSplitMode: params.paymentSplitMode,
+    onlineFoodPaidAmount: params.onlineFoodPaidAmount,
+    cashDueToRider: params.cashDueToRider,
     items: enrichedItems,
   });
 

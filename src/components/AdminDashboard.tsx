@@ -57,15 +57,20 @@ import {
   ADMIN_PIN_DEFAULT_EMAIL,
   AI_PROVIDER_PRESETS,
   type AiProviderType,
+  calculateSplitOrderFinancials,
   canActorModifyUserAccount,
   CUISINE_PRESET_OPTIONS,
+  DEFAULT_DELIVERY_FINANCIAL_CONFIG,
+  type DeliveryFinancialConfig,
   detectOrderBatchChanges,
+  DHAKA_ZONE_PRESETS,
   FOOD_CATEGORY_PRESET_OPTIONS,
   formatBdt,
   formatResolvedMapAddress,
   getOrderEmailTemplatePreview,
   isOwnerRestaurant,
   isProtectedSuperAdminEmail,
+  mergeDeliveryFinancialConfig,
   ORDER_EMAIL_TEMPLATE_PRESETS,
   OrderStatus,
   PRIMARY_SUPER_ADMIN_EMAIL,
@@ -80,15 +85,18 @@ import type {
   AuditLogItem,
   BackendStatusSummary,
   Coupon,
+  DhakaZoneCoverageItem,
   FoodItem,
   Lang,
   LedgerEntry,
   OrderEmailLog,
   OrderRecord,
+  PaymentTransactionRecord,
   PayoutRecord,
   PlatformSettings,
   Restaurant,
   RiderRecord,
+  RiderWalletLedgerEntry,
   StorefrontConfig,
   VendorAdminMessage,
 } from '../types/marketplace';
@@ -234,6 +242,22 @@ export function AdminDashboard({
   const [payouts, setPayouts] = useState<PayoutRecord[]>([]);
   const [coupons, setCoupons] = useState<Coupon[]>([]);
   const [riders, setRiders] = useState<RiderRecord[]>([]);
+  const [dhakaZoneCoverage, setDhakaZoneCoverage] = useState<DhakaZoneCoverageItem[]>([]);
+  const [deliveryFinancialConfig, setDeliveryFinancialConfig] =
+    useState<DeliveryFinancialConfig>(DEFAULT_DELIVERY_FINANCIAL_CONFIG);
+  const [savingFinancialConfig, setSavingFinancialConfig] = useState(false);
+  const [paymentTransactions, setPaymentTransactions] = useState<PaymentTransactionRecord[]>([]);
+  const [riderWalletLedger, setRiderWalletLedger] = useState<RiderWalletLedgerEntry[]>([]);
+  const [txFilter, setTxFilter] = useState<
+    'all' | 'food_payment' | 'delivery_cash' | 'reversals' | 'settlements'
+  >('all');
+  const [pendingZoneDrafts, setPendingZoneDrafts] = useState<Record<number, string>>({});
+  const [settleModalRider, setSettleModalRider] = useState<RiderRecord | null>(null);
+  const [settleAmount, setSettleAmount] = useState('');
+  const [settleMethod, setSettleMethod] = useState('cash');
+  const [settleRef, setSettleRef] = useState('');
+  const [settleNote, setSettleNote] = useState('');
+  const [settlingCommission, setSettlingCommission] = useState(false);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
   const [settings, setSettings] = useState<PlatformSettings | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -415,6 +439,10 @@ export function AdminDashboard({
         payouts: PayoutRecord[];
         coupons: Coupon[];
         riders: RiderRecord[];
+        dhakaZoneCoverage?: DhakaZoneCoverageItem[];
+        deliveryFinancialConfig?: DeliveryFinancialConfig | null;
+        paymentTransactions?: PaymentTransactionRecord[];
+        riderWalletLedger?: RiderWalletLedgerEntry[];
         auditLogs: AuditLogItem[];
         settings: PlatformSettings | null;
         adminPinEmails?: string[];
@@ -452,6 +480,9 @@ export function AdminDashboard({
       setPayouts(res.payouts);
       setCoupons(res.coupons);
       setRiders(res.riders);
+      setDhakaZoneCoverage(res.dhakaZoneCoverage || []);
+      setPaymentTransactions(res.paymentTransactions || []);
+      setRiderWalletLedger(res.riderWalletLedger || []);
       setAuditLogs(res.auditLogs || []);
       setSettings(res.settings);
       if (Array.isArray(res.adminPinEmails) && res.adminPinEmails.length > 0) {
@@ -464,6 +495,13 @@ export function AdminDashboard({
         setServiceFee(String(res.settings.serviceFee));
         setMinOrderDefault(String(res.settings.minOrderDefault));
         setStorefrontForm(mergeStorefrontConfig(res.settings.storefrontConfig));
+        setDeliveryFinancialConfig(
+          mergeDeliveryFinancialConfig(
+            res.deliveryFinancialConfig || res.settings.deliveryFinancialConfig
+          )
+        );
+      } else if (res.deliveryFinancialConfig && !silent) {
+        setDeliveryFinancialConfig(mergeDeliveryFinancialConfig(res.deliveryFinancialConfig));
       }
       if (!silent) {
         try {
@@ -1688,6 +1726,72 @@ export function AdminDashboard({
     }
   };
 
+  const handleSaveDeliveryFinancialConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingFinancialConfig(true);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch<{ deliveryFinancialConfig: DeliveryFinancialConfig }>(
+        '/api/admin/delivery-financial-config',
+        {
+          method: 'PATCH',
+          body: JSON.stringify(deliveryFinancialConfig),
+        }
+      );
+      setDeliveryFinancialConfig(mergeDeliveryFinancialConfig(res.deliveryFinancialConfig));
+      setFeedback(
+        lang === 'bn'
+          ? 'ডেলিভারি চার্জ, রাইডার আয় ও কমিশন নীতি সংরক্ষিত হয়েছে!'
+          : 'Zone/distance delivery pricing & rider commission rules saved!'
+      );
+      await loadAdmin(true);
+      await onRestaurantsMutated();
+    } catch (err: unknown) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Failed to save delivery financial config'
+      );
+    } finally {
+      setSavingFinancialConfig(false);
+    }
+  };
+
+  const handleSettleRiderCommission = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!settleModalRider) return;
+    const amt = Math.round(Number(settleAmount));
+    if (!Number.isFinite(amt) || amt <= 0) {
+      setErrorMsg('Enter a valid positive settlement amount.');
+      return;
+    }
+    setSettlingCommission(true);
+    setErrorMsg(null);
+    try {
+      await apiFetch(`/api/admin/riders/${encodeURIComponent(settleModalRider.uid)}/settle-commission`, {
+        method: 'POST',
+        body: JSON.stringify({
+          amount: amt,
+          method: settleMethod,
+          referenceId: settleRef.trim(),
+          note: settleNote.trim(),
+        }),
+      });
+      setFeedback(
+        lang === 'bn'
+          ? `${settleModalRider.fullName}-এর ৳${amt} কমিশন সেটেলমেন্ট রেকর্ড হয়েছে।`
+          : `Recorded ৳${amt} commission settlement for ${settleModalRider.fullName}.`
+      );
+      setSettleModalRider(null);
+      setSettleAmount('');
+      setSettleRef('');
+      setSettleNote('');
+      await loadAdmin();
+    } catch (err: unknown) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to record settlement');
+    } finally {
+      setSettlingCommission(false);
+    }
+  };
+
   const selectedRider = riders.find((r) => r.id === selectedRiderId) || riders[0] || null;
   const activeDeliveryOrders = useMemo(
     () => orders.filter((o) => o.status !== 'delivered' && o.status !== 'cancelled'),
@@ -1909,9 +2013,14 @@ export function AdminDashboard({
             labelEn: `Vendor Messages (${messageThreads.reduce((s, t) => s + t.unreadForAdmin, 0)})`,
             icon: MessageSquare,
           },
-          { id: 'finance' as const, labelBn: 'কমিশন ও পেআউট', labelEn: 'Ledger & Payouts', icon: Wallet },
+          { id: 'finance' as const, labelBn: 'কমিশন ও পেআউট', labelEn: 'Ledger & Pricing', icon: Wallet },
           { id: 'coupons' as const, labelBn: 'কুপন ম্যানেজমেন্ট', labelEn: 'Coupons', icon: Tag },
-          { id: 'users' as const, labelBn: 'ইউজার ও রাইডার', labelEn: 'Users & Riders', icon: Users },
+          {
+            id: 'users' as const,
+            labelBn: `ইউজার ও রাইডার (${riders.filter((r) => r.status === 'pending').length} অপেক্ষমাণ)`,
+            labelEn: `Users & Riders (${riders.filter((r) => r.status === 'pending').length} pending)`,
+            icon: Users,
+          },
         ].map((tItem) => {
           const Icon = tItem.icon;
           return (
@@ -4841,76 +4950,601 @@ export function AdminDashboard({
           </div>
         </div>
       ) : tab === 'finance' ? (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className="lg:col-span-7 bg-white rounded-2xl border border-neutral-200 p-5 overflow-x-auto">
-            <h2 className="font-bold text-sm text-[#2E3138] mb-3">
-              {lang === 'bn' ? 'প্ল্যাটফর্ম কমিশন লেজার' : 'Platform Commission Ledger'}
-            </h2>
-            <table className="w-full text-xs text-left tabular-nums">
-              <thead>
-                <tr className="border-b border-neutral-200 text-neutral-500">
-                  <th className="py-2">Entry</th>
-                  <th className="py-2">Note</th>
-                  <th className="py-2 text-right">Commission</th>
-                  <th className="py-2 text-right">Vendor Net</th>
-                </tr>
-              </thead>
-              <tbody>
-                {ledger.map((l) => (
-                  <tr key={l.id} className="border-b border-neutral-100">
-                    <td className="py-2 font-semibold uppercase">{l.entryType.replace('_', ' ')}</td>
-                    <td className="py-2 text-neutral-600">{l.note}</td>
-                    <td
-                      className={`py-2 text-right font-bold ${
-                        l.commissionAmount < 0 ? 'text-red-600' : 'text-emerald-700'
-                      }`}
-                    >
-                      {formatBdt(l.commissionAmount, lang)}
-                    </td>
-                    <td className="py-2 text-right">{formatBdt(l.netRestaurantAmount, lang)}</td>
-                  </tr>
+        <div className="space-y-6">
+          {/* Delivery Charge, Zone/Distance Pricing & Rider Commission Configurator */}
+          <form
+            onSubmit={handleSaveDeliveryFinancialConfig}
+            data-testid="admin-delivery-financial-config-form"
+            className="bg-white rounded-2xl border border-neutral-200 p-5 space-y-5"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-bold text-base text-[#2E3138]">
+                  {lang === 'bn'
+                    ? 'ডেলিভারি চার্জ (ঢাকা জোন ও দূরত্ব) এবং রাইডার কমিশন নীতি'
+                    : 'Delivery Charge (Zone & Distance) & Rider Commission Configuration'}
+                </h2>
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  {lang === 'bn'
+                    ? 'গ্রাহক অনলাইনে খাবারের দাম দেবে এবং রাইডার হাতে ডেলিভারি চার্জ নেবে। Foodora কমিশন রাইডার ওয়ালেটে বকেয়া থাকবে।'
+                    : 'Customers pay food price online; riders collect delivery charge in cash and owe Foodora commission in their wallet.'}
+                </p>
+              </div>
+              <button
+                type="submit"
+                disabled={savingFinancialConfig}
+                className="px-4 py-2 rounded-xl bg-[#E21B70] hover:bg-[#C4135E] text-white text-xs font-bold disabled:opacity-50"
+              >
+                {savingFinancialConfig
+                  ? lang === 'bn'
+                    ? 'সংরক্ষণ হচ্ছে...'
+                    : 'Saving Rules...'
+                  : lang === 'bn'
+                  ? 'নীতি সংরক্ষণ করুন'
+                  : 'Save Pricing & Commission Rules'}
+              </button>
+            </div>
+
+            {/* 12 Dhaka Zones Delivery Charge Grid */}
+            <div>
+              <h3 className="text-xs font-bold uppercase tracking-wide text-neutral-600 mb-2">
+                {lang === 'bn'
+                  ? 'ঢাকার ১২টি জোনের ডেলিভারি চার্জ (৳)'
+                  : 'Dhaka 12-Zone Base Delivery Charge (৳)'}
+              </h3>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5">
+                {DHAKA_ZONE_PRESETS.map((z) => (
+                  <div
+                    key={z.code}
+                    className="p-2.5 rounded-xl border border-neutral-200 bg-neutral-50 flex items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-bold text-[#2E3138] truncate">{z.code}</p>
+                      <p className="text-[11px] text-neutral-500 truncate">
+                        {lang === 'bn' ? z.nameBn : z.name}
+                      </p>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1000}
+                      aria-label={`Delivery fee for ${z.label}`}
+                      value={deliveryFinancialConfig.zoneFees[z.code] ?? z.defaultDeliveryFee}
+                      onChange={(e) => {
+                        const val = Math.max(0, Math.round(Number(e.target.value) || 0));
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          zoneFees: { ...prev.zoneFees, [z.code]: val },
+                        }));
+                      }}
+                      className="w-16 px-2 py-1 rounded-lg border border-neutral-300 bg-white text-right font-bold tabular-nums"
+                    />
+                  </div>
                 ))}
-              </tbody>
-            </table>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              {/* Distance Pricing Rules */}
+              <div className="rounded-xl border border-neutral-200 p-4 space-y-3 text-xs">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-[#2E3138]">
+                    {lang === 'bn' ? 'দূরত্ব-ভিত্তিক চার্জ' : 'Distance Pricing Rules'}
+                  </h3>
+                  <label className="inline-flex items-center gap-1.5 font-semibold text-neutral-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={deliveryFinancialConfig.distancePricing.enabled}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          distancePricing: {
+                            ...prev.distancePricing,
+                            enabled: e.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    <span>{lang === 'bn' ? 'সক্রিয়' : 'Enabled'}</span>
+                  </label>
+                </div>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">Base Km</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      value={deliveryFinancialConfig.distancePricing.baseDistanceKm}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          distancePricing: {
+                            ...prev.distancePricing,
+                            baseDistanceKm: Math.max(0, Number(e.target.value) || 0),
+                          },
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 tabular-nums"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">Base Fee (৳)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={deliveryFinancialConfig.distancePricing.baseFee}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          distancePricing: {
+                            ...prev.distancePricing,
+                            baseFee: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                          },
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 tabular-nums"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">Per Extra Km (৳)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={deliveryFinancialConfig.distancePricing.perKmFee}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          distancePricing: {
+                            ...prev.distancePricing,
+                            perKmFee: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                          },
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 tabular-nums"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">Min / Max (৳)</label>
+                    <div className="flex gap-1">
+                      <input
+                        type="number"
+                        min={0}
+                        value={deliveryFinancialConfig.distancePricing.minFee}
+                        onChange={(e) =>
+                          setDeliveryFinancialConfig((prev) => ({
+                            ...prev,
+                            distancePricing: {
+                              ...prev.distancePricing,
+                              minFee: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                            },
+                          }))
+                        }
+                        className="w-1/2 px-2 py-1.5 rounded-lg border border-neutral-200 tabular-nums"
+                      />
+                      <input
+                        type="number"
+                        min={10}
+                        value={deliveryFinancialConfig.distancePricing.maxFee}
+                        onChange={(e) =>
+                          setDeliveryFinancialConfig((prev) => ({
+                            ...prev,
+                            distancePricing: {
+                              ...prev.distancePricing,
+                              maxFee: Math.max(10, Math.round(Number(e.target.value) || 10)),
+                            },
+                          }))
+                        }
+                        className="w-1/2 px-2 py-1.5 rounded-lg border border-neutral-200 tabular-nums"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Rider Earning vs Foodora Commission Split */}
+              <div className="rounded-xl border border-neutral-200 p-4 space-y-3 text-xs">
+                <h3 className="font-bold text-[#2E3138]">
+                  {lang === 'bn'
+                    ? 'রাইডার আয় ও Foodora কমিশন'
+                    : 'Rider Earning & Foodora Commission'}
+                </h3>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">Rule Mode</label>
+                    <select
+                      value={deliveryFinancialConfig.riderEarningRule.mode}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          riderEarningRule: {
+                            ...prev.riderEarningRule,
+                            mode: e.target.value === 'fixed' ? 'fixed' : 'percentage',
+                          },
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 bg-white font-semibold"
+                    >
+                      <option value="percentage">Percentage of Delivery Fee (%)</option>
+                      <option value="fixed">Fixed Rider Earning (৳)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">
+                      {deliveryFinancialConfig.riderEarningRule.mode === 'percentage'
+                        ? 'Rider Share (%)'
+                        : 'Rider Fixed (৳)'}
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={deliveryFinancialConfig.riderEarningRule.mode === 'percentage' ? 100 : 1000}
+                      value={deliveryFinancialConfig.riderEarningRule.value}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          riderEarningRule: {
+                            ...prev.riderEarningRule,
+                            value: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                          },
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 font-bold tabular-nums"
+                    />
+                  </div>
+                </div>
+                {(() => {
+                  const sampleSplit = calculateSplitOrderFinancials({
+                    subtotal: 500,
+                    discountAmount: 0,
+                    deliveryFee: 60,
+                    serviceFee: 0,
+                    commissionType: 'percentage',
+                    commissionRate: 15,
+                    fixedCommission: 0,
+                    paymentMethod: 'bkash',
+                    riderEarningRule: deliveryFinancialConfig.riderEarningRule,
+                  });
+                  return (
+                    <div className="rounded-lg bg-purple-50 border border-purple-200 p-2.5 space-y-1 text-[11px] text-purple-950 tabular-nums">
+                      <p className="font-bold">Live Preview on ৳60 Delivery Charge:</p>
+                      <p>
+                        Cash Collected: <strong>৳60</strong> → Rider Keeps:{' '}
+                        <strong className="text-emerald-700">
+                          ৳{sampleSplit.riderEarningAmount}
+                        </strong>{' '}
+                        · Owed to Foodora:{' '}
+                        <strong className="text-[#E21B70]">
+                          ৳{sampleSplit.foodoraDeliveryCommission}
+                        </strong>
+                      </p>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* Settlement Rules */}
+              <div className="rounded-xl border border-neutral-200 p-4 space-y-2.5 text-xs">
+                <h3 className="font-bold text-[#2E3138]">
+                  {lang === 'bn' ? 'কমিশন সেটেলমেন্ট নিয়ম' : 'Commission Settlement Rules'}
+                </h3>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] text-neutral-500 mb-1">
+                      Max Outstanding Cap (৳)
+                    </label>
+                    <input
+                      type="number"
+                      min={50}
+                      value={deliveryFinancialConfig.settlementRules.maxOutstandingLimit}
+                      onChange={(e) =>
+                        setDeliveryFinancialConfig((prev) => ({
+                          ...prev,
+                          settlementRules: {
+                            ...prev.settlementRules,
+                            maxOutstandingLimit: Math.max(
+                              50,
+                              Math.round(Number(e.target.value) || 50)
+                            ),
+                          },
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 tabular-nums"
+                    />
+                  </div>
+                  <div className="flex flex-col justify-end gap-1">
+                    <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={deliveryFinancialConfig.settlementRules.autoBlockDispatchAboveLimit}
+                        onChange={(e) =>
+                          setDeliveryFinancialConfig((prev) => ({
+                            ...prev,
+                            settlementRules: {
+                              ...prev.settlementRules,
+                              autoBlockDispatchAboveLimit: e.target.checked,
+                            },
+                          }))
+                        }
+                      />
+                      <span>Block Dispatch Above Cap</span>
+                    </label>
+                    <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={deliveryFinancialConfig.settlementRules.requireCashConfirmation}
+                        onChange={(e) =>
+                          setDeliveryFinancialConfig((prev) => ({
+                            ...prev,
+                            settlementRules: {
+                              ...prev.settlementRules,
+                              requireCashConfirmation: e.target.checked,
+                            },
+                          }))
+                        }
+                      />
+                      <span>Require Cash Confirm Checkbox</span>
+                    </label>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[11px] text-neutral-500 mb-1">
+                    Rider Settlement Instructions (No Automated Payouts)
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={deliveryFinancialConfig.settlementRules.settlementInstructions}
+                    onChange={(e) =>
+                      setDeliveryFinancialConfig((prev) => ({
+                        ...prev,
+                        settlementRules: {
+                          ...prev.settlementRules,
+                          settlementInstructions: e.target.value,
+                        },
+                      }))
+                    }
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-neutral-200 text-[11px]"
+                  />
+                </div>
+              </div>
+            </div>
+          </form>
+
+          {/* Complete Financial Records: Split Payment Transactions & Rider Wallet Ledger */}
+          <div
+            data-testid="admin-split-financial-records"
+            className="bg-white rounded-2xl border border-neutral-200 p-5 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-bold text-sm text-[#2E3138]">
+                  {lang === 'bn'
+                    ? 'সম্পূর্ণ পেমেন্ট ও ডেলিভারি লেনদেন রেকর্ড'
+                    : 'Complete Split Payment & Rider Commission Records'}
+                </h2>
+                <p className="text-[11px] text-neutral-500">
+                  {lang === 'bn'
+                    ? 'অনলাইন ফুড পেমেন্ট, রাইডার ক্যাশ সংগ্রহ, রিফান্ড/রিভার্সাল এবং রাইডার কমিশন সেটেলমেন্ট'
+                    : 'Separate records for Online Food Payments, Delivery Cash Collections, Refunds/Reversals & Rider Settlements'}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                {[
+                  { id: 'all' as const, label: `All (${paymentTransactions.length})` },
+                  { id: 'food_payment' as const, label: 'Food Payments (Online)' },
+                  { id: 'delivery_cash' as const, label: 'Delivery Cash (Rider)' },
+                  { id: 'reversals' as const, label: 'Refunds & Reversals' },
+                  {
+                    id: 'settlements' as const,
+                    label: `Rider Wallet Ledger (${riderWalletLedger.length})`,
+                  },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setTxFilter(f.id)}
+                    className={`px-3 py-1 rounded-lg font-semibold border ${
+                      txFilter === f.id
+                        ? 'bg-[#E21B70] text-white border-[#E21B70]'
+                        : 'bg-neutral-50 text-neutral-700 border-neutral-200 hover:border-neutral-300'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {txFilter === 'settlements' ? (
+              <div className="overflow-x-auto border border-neutral-200 rounded-xl">
+                <table className="w-full text-xs text-left tabular-nums">
+                  <thead className="bg-neutral-50 text-neutral-500 uppercase text-[10px]">
+                    <tr>
+                      <th className="px-3 py-2">Rider UID</th>
+                      <th className="px-3 py-2">Entry Type</th>
+                      <th className="px-3 py-2">Order / Ref</th>
+                      <th className="px-3 py-2 text-right">Cash Collected</th>
+                      <th className="px-3 py-2 text-right">Rider Share</th>
+                      <th className="px-3 py-2 text-right">Commission +/-</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {riderWalletLedger.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="px-3 py-4 text-center text-neutral-500">
+                          No rider wallet entries recorded yet.
+                        </td>
+                      </tr>
+                    ) : (
+                      riderWalletLedger.map((entry) => (
+                        <tr key={entry.id}>
+                          <td className="px-3 py-2 font-mono text-[11px]">{entry.riderUid}</td>
+                          <td className="px-3 py-2 font-semibold capitalize">
+                            {entry.entryType.replace(/_/g, ' ')}
+                          </td>
+                          <td className="px-3 py-2 text-neutral-600">
+                            {entry.orderNumber || entry.referenceId || `#${entry.id}`}
+                          </td>
+                          <td className="px-3 py-2 text-right">
+                            {formatBdt(entry.cashCollected, lang)}
+                          </td>
+                          <td className="px-3 py-2 text-right text-emerald-700 font-semibold">
+                            {formatBdt(entry.riderEarningDelta, lang)}
+                          </td>
+                          <td className="px-3 py-2 text-right font-semibold">
+                            {entry.commissionSettledDelta > 0 ? (
+                              <span className="text-emerald-700">
+                                Settled {formatBdt(entry.commissionSettledDelta, lang)}
+                              </span>
+                            ) : (
+                              <span>{formatBdt(entry.commissionOwedDelta, lang)}</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="overflow-x-auto border border-neutral-200 rounded-xl">
+                <table className="w-full text-xs text-left tabular-nums">
+                  <thead className="bg-neutral-50 text-neutral-500 uppercase text-[10px]">
+                    <tr>
+                      <th className="px-3 py-2">Order</th>
+                      <th className="px-3 py-2">Transaction Kind</th>
+                      <th className="px-3 py-2">Method &amp; Flow</th>
+                      <th className="px-3 py-2">Status</th>
+                      <th className="px-3 py-2 text-right">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {(() => {
+                      const rows = paymentTransactions.filter((t) => {
+                        if (txFilter === 'food_payment') return t.txKind === 'food_payment';
+                        if (txFilter === 'delivery_cash') return t.txKind === 'delivery_cash';
+                        if (txFilter === 'reversals') {
+                          return t.txKind === 'food_refund' || t.txKind === 'delivery_reversal';
+                        }
+                        return true;
+                      });
+                      if (rows.length === 0) {
+                        return (
+                          <tr>
+                            <td colSpan={5} className="px-3 py-4 text-center text-neutral-500">
+                              No split payment transactions in this filter yet.
+                            </td>
+                          </tr>
+                        );
+                      }
+                      return rows.map((tx) => (
+                        <tr key={tx.id}>
+                          <td className="px-3 py-2 font-mono font-semibold text-[#2E3138]">
+                            {tx.orderNumber}
+                          </td>
+                          <td className="px-3 py-2 capitalize font-semibold">
+                            {tx.txKind.replace(/_/g, ' ')}
+                          </td>
+                          <td className="px-3 py-2 text-neutral-600">
+                            {tx.paymentMethod.toUpperCase()} · {tx.payerRole} → {tx.recipientRole}
+                            {tx.gatewayTxId ? ` (${tx.gatewayTxId})` : ''}
+                          </td>
+                          <td className="px-3 py-2 uppercase font-bold text-[10px]">
+                            <span
+                              className={`px-1.5 py-0.5 rounded ${
+                                tx.status === 'succeeded'
+                                  ? 'bg-emerald-50 text-emerald-700'
+                                  : tx.status === 'refunded' || tx.status === 'cancelled'
+                                  ? 'bg-red-50 text-red-700'
+                                  : 'bg-amber-50 text-amber-800'
+                              }`}
+                            >
+                              {tx.status}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 text-right font-bold text-[#2E3138]">
+                            {formatBdt(tx.amount, lang)}
+                          </td>
+                        </tr>
+                      ));
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
-          <div className="lg:col-span-5 bg-white rounded-2xl border border-neutral-200 p-5 space-y-3">
-            <h2 className="font-bold text-sm text-[#2E3138]">
-              {lang === 'bn' ? 'রেস্টুরেন্ট পেআউট অনুমোদন' : 'Restaurant Payout Queue'}
-            </h2>
-            {payouts.map((p) => (
-              <div
-                key={p.id}
-                className="p-3 rounded-xl border border-neutral-200 flex items-center justify-between gap-2 text-xs"
-              >
-                <div>
-                  <p className="font-bold text-[#2E3138]">{p.restaurantName}</p>
-                  <p className="text-neutral-500 tabular-nums">
-                    {formatBdt(p.amount, lang)} · {p.method.toUpperCase()} ({p.accountNumber})
-                  </p>
-                </div>
-                {p.status === 'pending' ? (
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => handlePayoutDecision(p.id, 'paid')}
-                      className="px-2.5 py-1 rounded bg-emerald-600 text-white font-semibold"
-                    >
-                      Pay
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handlePayoutDecision(p.id, 'rejected')}
-                      className="px-2.5 py-1 rounded border border-red-200 text-red-600 font-semibold"
-                    >
-                      Reject
-                    </button>
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-7 bg-white rounded-2xl border border-neutral-200 p-5 overflow-x-auto">
+              <h2 className="font-bold text-sm text-[#2E3138] mb-3">
+                {lang === 'bn' ? 'প্ল্যাটফর্ম কমিশন লেজার' : 'Platform Commission Ledger'}
+              </h2>
+              <table className="w-full text-xs text-left tabular-nums">
+                <thead>
+                  <tr className="border-b border-neutral-200 text-neutral-500">
+                    <th className="py-2">Entry</th>
+                    <th className="py-2">Note</th>
+                    <th className="py-2 text-right">Commission</th>
+                    <th className="py-2 text-right">Vendor Net</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ledger.map((l) => (
+                    <tr key={l.id} className="border-b border-neutral-100">
+                      <td className="py-2 font-semibold uppercase">{l.entryType.replace('_', ' ')}</td>
+                      <td className="py-2 text-neutral-600">{l.note}</td>
+                      <td
+                        className={`py-2 text-right font-bold ${
+                          l.commissionAmount < 0 ? 'text-red-600' : 'text-emerald-700'
+                        }`}
+                      >
+                        {formatBdt(l.commissionAmount, lang)}
+                      </td>
+                      <td className="py-2 text-right">{formatBdt(l.netRestaurantAmount, lang)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="lg:col-span-5 bg-white rounded-2xl border border-neutral-200 p-5 space-y-3">
+              <h2 className="font-bold text-sm text-[#2E3138]">
+                {lang === 'bn' ? 'রেস্টুরেন্ট পেআউট অনুমোদন' : 'Restaurant Payout Queue'}
+              </h2>
+              {payouts.map((p) => (
+                <div
+                  key={p.id}
+                  className="p-3 rounded-xl border border-neutral-200 flex items-center justify-between gap-2 text-xs"
+                >
+                  <div>
+                    <p className="font-bold text-[#2E3138]">{p.restaurantName}</p>
+                    <p className="text-neutral-500 tabular-nums">
+                      {formatBdt(p.amount, lang)} · {p.method.toUpperCase()} ({p.accountNumber})
+                    </p>
                   </div>
-                ) : (
-                  <span className="font-bold uppercase text-neutral-600">{p.status}</span>
-                )}
-              </div>
-            ))}
+                  {p.status === 'pending' ? (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => handlePayoutDecision(p.id, 'paid')}
+                        className="px-2.5 py-1 rounded bg-emerald-600 text-white font-semibold"
+                      >
+                        Pay
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handlePayoutDecision(p.id, 'rejected')}
+                        className="px-2.5 py-1 rounded border border-red-200 text-red-600 font-semibold"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  ) : (
+                    <span className="font-bold uppercase text-neutral-600">{p.status}</span>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       ) : tab === 'coupons' ? (
@@ -5034,6 +5668,175 @@ export function AdminDashboard({
               {currentUser.email} ({currentUser.role})
             </span>
           </div>
+
+          {/* 12-Zone Dhaka Rider Coverage Grid */}
+          {dhakaZoneCoverage.length > 0 && (
+            <div
+              data-testid="admin-dhaka-zone-coverage-grid"
+              className="bg-white rounded-2xl border border-neutral-200 p-5 space-y-3"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="font-bold text-sm text-[#2E3138]">
+                    {lang === 'bn'
+                      ? 'ঢাকার ১২টি জোনের রাইডার কাভারেজ ও ডেলিভারি রেট'
+                      : 'Dhaka 12-Zone Rider Coverage & Delivery Fee Matrix'}
+                  </h2>
+                  <p className="text-[11px] text-neutral-500">
+                    {lang === 'bn'
+                      ? 'কোন কোন ঢাকা জোনে অনুমোদিত রাইডার আছে এবং অর্ডার নেওয়া শুরু করা যাবে তা দেখুন'
+                      : 'See which Dhaka zones have approved/online riders ready to fulfill food deliveries'}
+                  </p>
+                </div>
+                <span className="px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-[11px] font-bold text-emerald-800">
+                  {dhakaZoneCoverage.filter((z) => z.hasActiveCoverage).length} /{' '}
+                  {dhakaZoneCoverage.length} Zones Covered
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5 text-xs">
+                {dhakaZoneCoverage.map((z) => (
+                  <div
+                    key={z.zoneCode}
+                    className={`rounded-xl border p-3 space-y-1 ${
+                      z.hasActiveCoverage
+                        ? 'border-emerald-200 bg-emerald-50/50'
+                        : 'border-neutral-200 bg-neutral-50'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="font-bold text-[#2E3138]">{z.zoneCode}</span>
+                      <span
+                        className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                          z.hasActiveCoverage
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : 'bg-amber-100 text-amber-800'
+                        }`}
+                      >
+                        {z.hasActiveCoverage ? 'Ready' : 'Needs Riders'}
+                      </span>
+                    </div>
+                    <p className="font-semibold text-neutral-700 truncate">
+                      {lang === 'bn' ? z.zoneNameBn : z.zoneName}
+                    </p>
+                    <div className="flex items-center justify-between text-[11px] text-neutral-600 tabular-nums pt-0.5">
+                      <span>
+                        {z.onlineCount} online / {z.approvedCount} ok
+                        {z.pendingCount > 0 ? ` · ${z.pendingCount} pending` : ''}
+                      </span>
+                      <span className="font-bold text-[#E21B70]">৳{z.deliveryFee}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Pending Dhaka Rider Approval Queue */}
+          {(() => {
+            const pendingRiders = riders.filter((r) => r.status === 'pending');
+            return (
+              <div
+                data-testid="admin-pending-rider-queue"
+                className="bg-white rounded-2xl border border-amber-300 p-5 space-y-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-bold text-sm text-[#2E3138]">
+                      {lang === 'bn'
+                        ? `রাইডার আবেদন অনুমোদন কিউ (${pendingRiders.length})`
+                        : `Pending Dhaka Rider Approval Queue (${pendingRiders.length})`}
+                    </h2>
+                    <p className="text-[11px] text-neutral-500">
+                      {lang === 'bn'
+                        ? 'নতুন রাইডাররা আবেদন করলে জোন যাচাই করে অ্যাপ্রুভ বা রিজেক্ট করুন।'
+                        : 'Assign or confirm each applicant’s Dhaka zone and approve them to start receiving deliveries.'}
+                    </p>
+                  </div>
+                </div>
+                {pendingRiders.length === 0 ? (
+                  <p className="text-xs text-neutral-500">
+                    {lang === 'bn'
+                      ? 'এই মুহূর্তে কোনো নতুন রাইডার আবেদন অপেক্ষমাণ নেই।'
+                      : 'No pending rider applications awaiting review right now.'}
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {pendingRiders.map((pr) => {
+                      const chosenZone = pendingZoneDrafts[pr.id] ?? pr.zone;
+                      return (
+                        <div
+                          key={pr.id}
+                          data-testid={`pending-rider-card-${pr.id}`}
+                          className="rounded-xl border border-amber-200 bg-amber-50/40 p-3.5 space-y-2.5 text-xs"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <p className="font-bold text-[#2E3138]">{pr.fullName}</p>
+                              <p className="text-neutral-600">
+                                {pr.phone} · {pr.email}
+                              </p>
+                              <p className="text-[11px] text-neutral-500">
+                                {pr.vehicleType} · NID: {pr.nidNumber || 'N/A'}
+                              </p>
+                            </div>
+                            <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-900 text-[10px] font-bold uppercase">
+                              pending
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <select
+                              aria-label={`Approve zone for ${pr.fullName}`}
+                              value={chosenZone}
+                              onChange={(e) =>
+                                setPendingZoneDrafts((prev) => ({
+                                  ...prev,
+                                  [pr.id]: e.target.value,
+                                }))
+                              }
+                              className="flex-1 min-w-[160px] px-2.5 py-1.5 rounded-lg border border-neutral-200 bg-white text-xs font-semibold"
+                            >
+                              <option value={pr.zone}>{pr.zone}</option>
+                              {DHAKA_ZONE_PRESETS.map((z) => (
+                                <option key={z.code} value={z.label}>
+                                  {z.label}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleUpdateRider(pr, {
+                                  status: 'approved',
+                                  isAvailable: true,
+                                  zone: chosenZone,
+                                })
+                              }
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold"
+                            >
+                              {lang === 'bn' ? 'অ্যাপ্রুভ করুন' : 'Approve & Activate'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleUpdateRider(pr, {
+                                  status: 'suspended',
+                                  isAvailable: false,
+                                })
+                              }
+                              className="px-2.5 py-1.5 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 font-semibold"
+                            >
+                              {lang === 'bn' ? 'বাতিল' : 'Reject'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="bg-white rounded-2xl border border-neutral-200 p-5 space-y-3">
@@ -5411,10 +6214,111 @@ export function AdminDashboard({
                           </button>
                         </div>
                       </div>
+
+                      {/* Rider Cash & Commission Wallet Summary + Manual Commission Settlement */}
+                      {r.walletSummary && (
+                        <div className="pt-2 border-t border-neutral-100 flex flex-wrap items-center justify-between gap-2 text-[11px] tabular-nums">
+                          <div className="flex flex-wrap items-center gap-2 text-neutral-600">
+                            <span>
+                              Cash: <strong>{formatBdt(r.walletSummary.totalCashCollected, lang)}</strong>
+                            </span>
+                            <span>·</span>
+                            <span className="text-emerald-700">
+                              Earned: <strong>{formatBdt(r.walletSummary.totalRiderEarnings, lang)}</strong>
+                            </span>
+                            <span>·</span>
+                            <span className="text-purple-800">
+                              Owed: <strong>{formatBdt(r.walletSummary.totalCommissionOwed, lang)}</strong>
+                            </span>
+                            <span>·</span>
+                            <span className="text-[#E21B70] font-bold">
+                              Outstanding:{' '}
+                              {formatBdt(r.walletSummary.outstandingCommission, lang)}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSettleModalRider(r);
+                              setSettleAmount(
+                                String(Math.max(0, r.walletSummary?.outstandingCommission || 0))
+                              );
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-purple-50 border border-purple-200 text-purple-900 font-bold hover:bg-purple-100"
+                          >
+                            {lang === 'bn' ? 'কমিশন সেটেল করুন' : 'Record Commission Settlement'}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
               </div>
+
+              {settleModalRider && (
+                <form
+                  onSubmit={handleSettleRiderCommission}
+                  data-testid="admin-rider-settlement-form"
+                  className="p-4 rounded-xl border border-purple-300 bg-purple-50/70 space-y-2.5 text-xs"
+                >
+                  <div className="flex items-center justify-between">
+                    <p className="font-bold text-purple-950">
+                      Record Commission Settlement — {settleModalRider.fullName}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setSettleModalRider(null)}
+                      className="text-neutral-500 hover:text-neutral-800"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <input
+                      type="number"
+                      required
+                      min={1}
+                      value={settleAmount}
+                      onChange={(e) => setSettleAmount(e.target.value)}
+                      placeholder="Amount (৳)"
+                      className="px-2.5 py-1.5 rounded-lg border border-neutral-300 bg-white font-bold tabular-nums"
+                    />
+                    <select
+                      value={settleMethod}
+                      onChange={(e) => setSettleMethod(e.target.value)}
+                      className="px-2.5 py-1.5 rounded-lg border border-neutral-300 bg-white font-semibold"
+                    >
+                      <option value="cash">Cash Handover</option>
+                      <option value="bkash">bKash</option>
+                      <option value="nagad">Nagad</option>
+                      <option value="bank">Bank Transfer</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={settleRef}
+                      onChange={(e) => setSettleRef(e.target.value)}
+                      placeholder="Ref / Tx ID (optional)"
+                      className="px-2.5 py-1.5 rounded-lg border border-neutral-300 bg-white"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={settleNote}
+                      onChange={(e) => setSettleNote(e.target.value)}
+                      placeholder="Settlement note (optional)"
+                      className="flex-1 px-2.5 py-1.5 rounded-lg border border-neutral-300 bg-white"
+                    />
+                    <button
+                      type="submit"
+                      disabled={settlingCommission}
+                      className="px-4 py-1.5 rounded-lg bg-[#E21B70] text-white font-bold disabled:opacity-50"
+                    >
+                      {settlingCommission ? 'Saving...' : 'Confirm Settlement'}
+                    </button>
+                  </div>
+                </form>
+              )}
             </div>
           </div>
         </div>

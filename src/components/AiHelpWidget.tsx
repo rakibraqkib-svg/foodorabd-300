@@ -17,6 +17,9 @@ import { apiFetch } from '../lib/api';
 import {
   buildMessengerUrl,
   buildWhatsAppSupportUrl,
+  coerceSafeErrorText,
+  extractAiReplyText,
+  sanitizeAiChatHistory,
   type AiHelpLangPreference,
 } from '../lib/marketplace-logic';
 import type { Lang, PublicAiProvider } from '../types/marketplace';
@@ -79,7 +82,53 @@ function WhatsAppIcon({ className = 'w-4 h-4' }: { className?: string }) {
   );
 }
 
-export function AiHelpWidget({
+class AiHelpErrorBoundary extends React.Component<
+  { children: React.ReactNode; uiLang: Lang },
+  { hasError: boolean }
+> {
+  constructor(props: { children: React.ReactNode; uiLang: Lang }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error('AiHelpWidget caught render error:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40">
+          <button
+            type="button"
+            onClick={() => this.setState({ hasError: false })}
+            className="px-4 py-2.5 rounded-2xl bg-[#E21B70] text-white shadow-xl text-xs font-extrabold inline-flex items-center gap-2"
+          >
+            <Sparkles className="w-4 h-4" />
+            <span>
+              {this.props.uiLang === 'bn' ? 'লাইভ চ্যাট রিসেট করুন' : 'Reset Live Chat'}
+            </span>
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export function AiHelpWidget(props: AiHelpWidgetProps) {
+  return (
+    <AiHelpErrorBoundary uiLang={props.uiLang}>
+      <AiHelpWidgetInner {...props} />
+    </AiHelpErrorBoundary>
+  );
+}
+
+function AiHelpWidgetInner({
   uiLang,
   area,
   viewType,
@@ -192,11 +241,12 @@ export function AiHelpWidget({
     setSending(true);
 
     try {
+      const sanitizedHistory = sanitizeAiChatHistory(messages);
       const res = await apiFetch<{
-        reply: string;
-        model?: string;
-        providerCode?: string;
-        providerName?: string;
+        reply?: unknown;
+        model?: unknown;
+        providerCode?: unknown;
+        providerName?: unknown;
         reasoningDetails?: unknown;
       }>('/api/ai/help', {
         method: 'POST',
@@ -205,42 +255,49 @@ export function AiHelpWidget({
           langPreference: langPref,
           uiLang,
           providerCode: targetProvider || undefined,
-          history: messages.slice(-8).map((m) => ({
-            role: m.role === 'assistant' ? 'model' : 'user',
-            text: m.text,
-            ...(m.role === 'assistant' && m.reasoningDetails !== undefined
-              ? { reasoning_details: m.reasoningDetails }
-              : {}),
-          })),
+          history: sanitizedHistory,
           context: {
-            area,
-            viewType,
-            activeOrderNumber,
+            area: String(area || 'Dhaka'),
+            viewType: String(viewType || 'home'),
+            activeOrderNumber: activeOrderNumber ? String(activeOrderNumber) : undefined,
           },
         }),
       });
 
-      const providerLabel = res.providerName
-        ? `${res.providerName}${res.model ? ` · ${res.model}` : ''}`
-        : res.model;
+      const safeReply = extractAiReplyText(res?.reply);
+      if (!safeReply) {
+        throw new Error(
+          uiLang === 'bn'
+            ? 'এই AI মডেলটি খালি উত্তর দিয়েছে। Foodora Own AI বা Pollinations Free AI ব্যবহার করে দেখুন।'
+            : 'That AI model returned an empty response. Switch to Foodora Own AI or Pollinations Free AI.'
+        );
+      }
+
+      const safeProviderName =
+        typeof res?.providerName === 'string' ? res.providerName.trim() : '';
+      const safeModelName = typeof res?.model === 'string' ? res.model.trim() : '';
+      const providerLabel = safeProviderName
+        ? `${safeProviderName}${safeModelName ? ` · ${safeModelName}` : ''}`
+        : safeModelName || undefined;
 
       setMessages((prev) => [
         ...prev,
         {
           id: `a-${Date.now()}`,
           role: 'assistant',
-          text: res.reply,
+          text: safeReply,
           providerLabel,
-          reasoningDetails: res.reasoningDetails,
+          reasoningDetails: res?.reasoningDetails,
         },
       ]);
     } catch (err: unknown) {
       setErrorMsg(
-        err instanceof Error
-          ? err.message
-          : uiLang === 'bn'
-          ? 'AI সহায়তা পাওয়া যায়নি। নিচের ফ্রি AI বা Messenger/WhatsApp ব্যবহার করুন।'
-          : 'Could not reach that AI engine. Try Foodora Own AI, Pollinations Free AI, or Messenger/WhatsApp support.'
+        coerceSafeErrorText(
+          err,
+          uiLang === 'bn'
+            ? 'AI সহায়তা পাওয়া যায়নি। নিচের ফ্রি AI বা Messenger/WhatsApp ব্যবহার করুন।'
+            : 'Could not reach that AI engine. Try Foodora Own AI, Pollinations Free AI, or Messenger/WhatsApp support.'
+        )
       );
     } finally {
       setSending(false);
@@ -258,43 +315,19 @@ export function AiHelpWidget({
 
   return (
     <>
-      {/* Floating Support Dock: Messenger + WhatsApp + Website Live Chat (AI Help) */}
+      {/* Single clean Foodora Live Chat launcher (Messenger & WhatsApp cleanly housed inside drawer & footer) */}
       {!open && (
         <div
           data-testid="support-dock"
-          className="fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 flex items-center gap-2"
+          className="fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40"
         >
-          <a
-            href={resolvedWhatsappUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            data-testid="whatsapp-floating-link"
-            aria-label="WhatsApp Contact & Support"
-            title={`WhatsApp Support (${displayWhatsappNumber})`}
-            className="w-10 h-10 rounded-2xl bg-[#25D366] hover:bg-[#1FB857] text-white shadow-lg flex items-center justify-center transition-transform hover:scale-105"
-          >
-            <WhatsAppIcon className="w-5 h-5" />
-          </a>
-
-          <a
-            href={resolvedMessengerUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            data-testid="messenger-floating-link"
-            aria-label="Facebook Messenger Live Chat"
-            title="Facebook Messenger Support"
-            className="w-10 h-10 rounded-2xl bg-[#0084FF] hover:bg-[#0070DB] text-white shadow-lg flex items-center justify-center transition-transform hover:scale-105"
-          >
-            <MessengerIcon className="w-5 h-5" />
-          </a>
-
           <button
             type="button"
             data-testid="ai-help-launcher"
             onClick={() => setOpen(true)}
             aria-label="Open Bilingual AI Help (Bangla and English)"
             style={{ backgroundColor: accentColor }}
-            className="px-3.5 py-2.5 rounded-2xl text-white shadow-xl hover:opacity-95 transition-all inline-flex items-center gap-2 text-xs font-extrabold"
+            className="px-4 py-2.5 rounded-2xl text-white shadow-xl hover:opacity-95 transition-all inline-flex items-center gap-2 text-xs font-extrabold"
           >
             <Sparkles className="w-4 h-4 shrink-0" />
             <span>
@@ -366,11 +399,11 @@ export function AiHelpWidget({
               </div>
             </div>
 
-            {/* Direct Multi-Channel Strip: Website Live Chat + Facebook Messenger + WhatsApp */}
-            <div className="px-3 py-2 bg-white border-b border-neutral-200 grid grid-cols-3 gap-1.5 text-[11px] shrink-0">
-              <div className="px-2 py-1.5 rounded-xl bg-[#FFF0F6] border border-[#E21B70]/30 text-[#E21B70] font-bold flex items-center justify-center gap-1.5">
+            {/* Sleek Integrated Support Channel Strip: Website Live Chat + Facebook Messenger + WhatsApp */}
+            <div className="px-2.5 sm:px-3 py-2 bg-white border-b border-neutral-200 grid grid-cols-3 gap-1 sm:gap-1.5 text-[11px] shrink-0">
+              <div className="px-1.5 sm:px-2 py-1.5 rounded-xl bg-[#FFF0F6] border border-[#E21B70]/25 text-[#E21B70] font-bold flex items-center justify-center gap-1 sm:gap-1.5 min-w-0">
                 <MessageCircle className="w-3.5 h-3.5 shrink-0" />
-                <span className="truncate">{displayBn ? 'ওয়েব লাইভ চ্যাট' : 'Live Chat'}</span>
+                <span className="truncate">{displayBn ? 'লাইভ চ্যাট' : 'Live Chat'}</span>
               </div>
 
               <a
@@ -378,11 +411,11 @@ export function AiHelpWidget({
                 target="_blank"
                 rel="noopener noreferrer"
                 data-testid="messenger-panel-link"
-                className="px-2 py-1.5 rounded-xl bg-[#0084FF] hover:bg-[#0070DB] text-white font-bold flex items-center justify-center gap-1.5 transition-colors"
+                className="px-1.5 sm:px-2 py-1.5 rounded-xl bg-neutral-50 hover:bg-neutral-100 border border-neutral-200 text-[#2E3138] font-semibold flex items-center justify-center gap-1 sm:gap-1.5 transition-colors min-w-0"
               >
-                <MessengerIcon className="w-3.5 h-3.5 shrink-0" />
+                <MessengerIcon className="w-3.5 h-3.5 shrink-0 text-[#0084FF]" />
                 <span className="truncate">Messenger</span>
-                <ExternalLink className="w-2.5 h-2.5 opacity-80 shrink-0" />
+                <ExternalLink className="w-2.5 h-2.5 text-neutral-400 shrink-0 hidden sm:inline" />
               </a>
 
               <a
@@ -390,11 +423,11 @@ export function AiHelpWidget({
                 target="_blank"
                 rel="noopener noreferrer"
                 data-testid="whatsapp-panel-link"
-                className="px-2 py-1.5 rounded-xl bg-[#25D366] hover:bg-[#1FB857] text-white font-bold flex items-center justify-center gap-1.5 transition-colors"
+                className="px-1.5 sm:px-2 py-1.5 rounded-xl bg-neutral-50 hover:bg-neutral-100 border border-neutral-200 text-[#2E3138] font-semibold flex items-center justify-center gap-1 sm:gap-1.5 transition-colors min-w-0"
               >
-                <WhatsAppIcon className="w-3.5 h-3.5 shrink-0" />
+                <WhatsAppIcon className="w-3.5 h-3.5 shrink-0 text-[#16A34A]" />
                 <span className="truncate">WhatsApp</span>
-                <ExternalLink className="w-2.5 h-2.5 opacity-80 shrink-0" />
+                <ExternalLink className="w-2.5 h-2.5 text-neutral-400 shrink-0 hidden sm:inline" />
               </a>
             </div>
 
@@ -515,37 +548,45 @@ export function AiHelpWidget({
                   </div>
                 </div>
               ) : (
-                messages.map((m) => (
-                  <div
-                    key={m.id}
-                    className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                  >
+                messages.map((m) => {
+                  const safeText = extractAiReplyText(m.text) || String(m.text ?? '');
+                  const safeProviderLabel =
+                    typeof m.providerLabel === 'string' ? m.providerLabel : '';
+                  return (
                     <div
-                      className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed whitespace-pre-wrap ${
-                        m.role === 'user'
-                          ? 'bg-[#E21B70] text-white rounded-br-sm'
-                          : 'bg-white border border-neutral-200 text-[#2E3138] rounded-bl-sm shadow-2xs'
-                      }`}
+                      key={m.id}
+                      className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
                     >
-                      <p>
-                        {m.text.split(/(\*\*[^*\n]+\*\*)/g).map((part, idx) =>
-                          part.startsWith('**') && part.endsWith('**') && part.length > 4 ? (
-                            <strong key={idx} className="font-bold text-[#2E3138]">
-                              {part.slice(2, -2)}
-                            </strong>
-                          ) : (
-                            <React.Fragment key={idx}>{part}</React.Fragment>
-                          )
-                        )}
-                      </p>
-                      {m.providerLabel && (
-                        <p className="mt-1.5 pt-1 border-t border-neutral-100 text-[10px] text-neutral-400">
-                          {m.providerLabel}
+                      <div
+                        data-testid={
+                          m.role === 'assistant' ? 'ai-assistant-message' : 'ai-user-message'
+                        }
+                        className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed whitespace-pre-wrap ${
+                          m.role === 'user'
+                            ? 'bg-[#E21B70] text-white rounded-br-sm'
+                            : 'bg-white border border-neutral-200 text-[#2E3138] rounded-bl-sm shadow-2xs'
+                        }`}
+                      >
+                        <p>
+                          {safeText.split(/(\*\*[^*\n]+\*\*)/g).map((part, idx) =>
+                            part.startsWith('**') && part.endsWith('**') && part.length > 4 ? (
+                              <strong key={idx} className="font-bold text-[#2E3138]">
+                                {part.slice(2, -2)}
+                              </strong>
+                            ) : (
+                              <React.Fragment key={idx}>{part}</React.Fragment>
+                            )
+                          )}
                         </p>
-                      )}
+                        {safeProviderLabel && (
+                          <p className="mt-1.5 pt-1 border-t border-neutral-100 text-[10px] text-neutral-400">
+                            {safeProviderLabel}
+                          </p>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
 
               {sending && (

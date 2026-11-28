@@ -14,6 +14,7 @@ import {
   orders,
   orderStatusHistory,
   paymentGateways,
+  paymentTransactions,
   platformSettings,
   restaurantPayouts,
   restaurants,
@@ -21,15 +22,19 @@ import {
   riderJobApplications,
   riderJobs,
   riders,
+  riderWalletLedger,
   users,
   vendorAdminMessages,
 } from './schema.ts';
 import {
   DEFAULT_AI_PROVIDERS,
   DEFAULT_PAYMENT_GATEWAYS,
+  mergeDeliveryFinancialConfig,
   partitionOwnedVsPartnerRestaurants,
   pickNearestStandbyRider,
   PROTECTED_SUPER_ADMIN_EMAILS,
+  summarizeDhakaZoneRiderCoverage,
+  summarizeRiderWalletLedger,
 } from '../lib/marketplace-logic.ts';
 
 export async function getApprovedRestaurants() {
@@ -259,11 +264,19 @@ export async function getOrderById(orderId: number) {
       }
     }
 
-    const emailLogs = await db
-      .select()
-      .from(orderEmailLogs)
-      .where(eq(orderEmailLogs.orderId, orderId))
-      .orderBy(desc(orderEmailLogs.sentAt));
+    const [emailLogs, transactions, settings] = await Promise.all([
+      db
+        .select()
+        .from(orderEmailLogs)
+        .where(eq(orderEmailLogs.orderId, orderId))
+        .orderBy(desc(orderEmailLogs.sentAt)),
+      db
+        .select()
+        .from(paymentTransactions)
+        .where(eq(paymentTransactions.orderId, orderId))
+        .orderBy(asc(paymentTransactions.id)),
+      getPlatformSettingsRow(),
+    ]);
 
     return {
       order,
@@ -272,6 +285,10 @@ export async function getOrderById(orderId: number) {
       riderLocation,
       nearestRider,
       emailLogs,
+      transactions,
+      deliveryFinancialConfig: mergeDeliveryFinancialConfig(
+        (settings?.deliveryFinancialConfig as Record<string, unknown> | undefined) || null
+      ),
     };
   } catch (error) {
     console.error('Failed to fetch order detail:', error);
@@ -508,25 +525,33 @@ export async function getVendorWorkspace(
 
 export async function getRiderWorkspace(riderUid: string) {
   try {
-    const [riderRows, userRows, allOrders, allRestaurants] = await Promise.all([
-      db.select().from(riders).where(eq(riders.uid, riderUid)).limit(1),
-      db
-        .select({ avatarUrl: users.avatarUrl })
-        .from(users)
-        .where(eq(users.uid, riderUid))
-        .limit(1),
-      db.select().from(orders).orderBy(desc(orders.createdAt)),
-      db
-        .select({
-          id: restaurants.id,
-          name: restaurants.name,
-          lat: restaurants.lat,
-          lng: restaurants.lng,
-          address: restaurants.address,
-          phone: restaurants.phone,
-        })
-        .from(restaurants),
-    ]);
+    const [riderRows, userRows, allOrders, allRestaurants, walletEntries, settings, allRiders] =
+      await Promise.all([
+        db.select().from(riders).where(eq(riders.uid, riderUid)).limit(1),
+        db
+          .select({ avatarUrl: users.avatarUrl })
+          .from(users)
+          .where(eq(users.uid, riderUid))
+          .limit(1),
+        db.select().from(orders).orderBy(desc(orders.createdAt)),
+        db
+          .select({
+            id: restaurants.id,
+            name: restaurants.name,
+            lat: restaurants.lat,
+            lng: restaurants.lng,
+            address: restaurants.address,
+            phone: restaurants.phone,
+          })
+          .from(restaurants),
+        db
+          .select()
+          .from(riderWalletLedger)
+          .where(eq(riderWalletLedger.riderUid, riderUid))
+          .orderBy(desc(riderWalletLedger.createdAt)),
+        getPlatformSettingsRow(),
+        db.select().from(riders),
+      ]);
     const restCoordMap = new Map(
       allRestaurants.map((r) => [
         r.id,
@@ -543,14 +568,23 @@ export async function getRiderWorkspace(riderUid: string) {
         restaurantPhone: coords?.phone || '',
       };
     });
-    const availableOrders = withRestCoords.filter(
-      (o) =>
-        o.deliveryMode === 'platform' &&
-        !o.riderUid &&
-        ['accepted', 'preparing', 'ready'].includes(o.status)
-    );
-    const assignedOrders = withRestCoords.filter((o) => o.riderUid === riderUid);
     const baseRider = riderRows[0] ?? null;
+    const isApprovedRider = baseRider?.status === 'approved';
+    const availableOrders = isApprovedRider
+      ? withRestCoords.filter(
+          (o) =>
+            o.deliveryMode === 'platform' &&
+            !o.riderUid &&
+            ['accepted', 'preparing', 'ready'].includes(o.status) &&
+            (o.paymentMethod === 'cod' || o.paymentStatus === 'paid')
+        )
+      : [];
+    const assignedOrders = withRestCoords.filter((o) => o.riderUid === riderUid);
+    const walletSummary = summarizeRiderWalletLedger(walletEntries);
+    const financialConfig = mergeDeliveryFinancialConfig(
+      (settings?.deliveryFinancialConfig as Record<string, unknown> | undefined) || null
+    );
+    const zoneCoverage = summarizeDhakaZoneRiderCoverage(allRiders, financialConfig);
     const enrichedRider = baseRider
       ? {
           ...baseRider,
@@ -558,12 +592,18 @@ export async function getRiderWorkspace(riderUid: string) {
           restaurantName: baseRider.restaurantId
             ? restCoordMap.get(baseRider.restaurantId)?.name || null
             : null,
+          walletSummary,
         }
       : null;
     return {
       rider: enrichedRider,
       availableOrders,
       assignedOrders,
+      walletSummary,
+      walletLedger: walletEntries,
+      settlementRules: financialConfig.settlementRules,
+      deliveryFinancialConfig: financialConfig,
+      zoneCoverage,
     };
   } catch (error) {
     console.error('Failed to load rider workspace:', error);
@@ -585,6 +625,8 @@ export async function getAdminWorkspace() {
       recentAuditLogs,
       settings,
       adminPinCreds,
+      allTransactions,
+      allWalletLedger,
     ] = await Promise.all([
       db.select().from(restaurants).orderBy(desc(restaurants.createdAt)),
       db.select().from(foodItems).orderBy(desc(foodItems.id)),
@@ -600,6 +642,8 @@ export async function getAdminWorkspace() {
         .select({ email: localCredentials.email })
         .from(localCredentials)
         .where(like(localCredentials.email, '__admin_pin__:%')),
+      db.select().from(paymentTransactions).orderBy(desc(paymentTransactions.createdAt)).limit(250),
+      db.select().from(riderWalletLedger).orderBy(desc(riderWalletLedger.createdAt)).limit(300),
     ]);
 
     const adminPinEmailSet = new Set<string>(PROTECTED_SUPER_ADMIN_EMAILS);
@@ -607,6 +651,24 @@ export async function getAdminWorkspace() {
       const stripped = row.email.replace(/^__admin_pin__:/, '').trim().toLowerCase();
       if (stripped) adminPinEmailSet.add(stripped);
     }
+
+    const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+      (settings?.deliveryFinancialConfig as Record<string, unknown> | undefined) || null
+    );
+
+    const ledgerByRider = new Map<string, typeof allWalletLedger>();
+    for (const entry of allWalletLedger) {
+      const list = ledgerByRider.get(entry.riderUid) || [];
+      list.push(entry);
+      ledgerByRider.set(entry.riderUid, list);
+    }
+
+    const enrichedRiders = allRiders.map((r) => ({
+      ...r,
+      walletSummary: summarizeRiderWalletLedger(ledgerByRider.get(r.uid) || []),
+    }));
+
+    const dhakaZoneCoverage = summarizeDhakaZoneRiderCoverage(allRiders, deliveryFinancialConfig);
 
     return {
       restaurants: allRestaurants,
@@ -616,10 +678,14 @@ export async function getAdminWorkspace() {
       ledger: allLedger,
       payouts: allPayouts,
       coupons: allCoupons,
-      riders: allRiders,
+      riders: enrichedRiders,
       auditLogs: recentAuditLogs,
       settings,
       adminPinEmails: Array.from(adminPinEmailSet),
+      deliveryFinancialConfig,
+      dhakaZoneCoverage,
+      paymentTransactions: allTransactions,
+      riderWalletLedger: allWalletLedger,
     };
   } catch (error) {
     console.error('Failed to load admin workspace:', error);

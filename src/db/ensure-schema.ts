@@ -37,6 +37,8 @@ const EXPECTED_TABLES = [
   'rider_job_applications',
   'vendor_admin_messages',
   'ai_providers',
+  'payment_transactions',
+  'rider_wallet_ledger',
 ] as const;
 
 async function runCreateTablesIfMissing(): Promise<void> {
@@ -66,7 +68,21 @@ async function runCreateTablesIfMissing(): Promise<void> {
       await db.execute(sql`
         ALTER TABLE orders
         ADD COLUMN IF NOT EXISTS customer_email TEXT NOT NULL DEFAULT '',
-        ADD COLUMN IF NOT EXISTS tracking_token TEXT NOT NULL DEFAULT '';
+        ADD COLUMN IF NOT EXISTS tracking_token TEXT NOT NULL DEFAULT '',
+        ADD COLUMN IF NOT EXISTS payment_split_mode TEXT NOT NULL DEFAULT 'online_food_cash_delivery',
+        ADD COLUMN IF NOT EXISTS online_food_paid_amount INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_due_to_rider INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS rider_earning_amount INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS foodora_delivery_commission INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_collection_status TEXT NOT NULL DEFAULT 'pending',
+        ADD COLUMN IF NOT EXISTS cash_collected_amount INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_collected_at TIMESTAMP;
+      `);
+    }
+    if (existingSet.has('platform_settings')) {
+      await db.execute(sql`
+        ALTER TABLE platform_settings
+        ADD COLUMN IF NOT EXISTS delivery_financial_config JSONB NOT NULL DEFAULT '{}'::jsonb;
       `);
     }
     if (existingSet.has('riders')) {
@@ -300,6 +316,14 @@ async function createMissingTables(existingSet: Set<string>): Promise<void> {
         rider_uid TEXT DEFAULT '',
         rider_name TEXT DEFAULT '',
         estimated_minutes INTEGER NOT NULL DEFAULT 30,
+        payment_split_mode TEXT NOT NULL DEFAULT 'online_food_cash_delivery',
+        online_food_paid_amount INTEGER NOT NULL DEFAULT 0,
+        cash_due_to_rider INTEGER NOT NULL DEFAULT 0,
+        rider_earning_amount INTEGER NOT NULL DEFAULT 0,
+        foodora_delivery_commission INTEGER NOT NULL DEFAULT 0,
+        cash_collection_status TEXT NOT NULL DEFAULT 'pending',
+        cash_collected_amount INTEGER NOT NULL DEFAULT 0,
+        cash_collected_at TIMESTAMP,
         items_snapshot_json JSONB NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -456,6 +480,7 @@ async function createMissingTables(existingSet: Set<string>): Promise<void> {
         sslcommerz_enabled BOOLEAN NOT NULL DEFAULT TRUE,
         sslcommerz_sandbox BOOLEAN NOT NULL DEFAULT TRUE,
         storefront_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+        delivery_financial_config JSONB NOT NULL DEFAULT '{}'::jsonb,
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
     `);
@@ -551,6 +576,48 @@ async function createMissingTables(existingSet: Set<string>): Promise<void> {
         sort_order INTEGER NOT NULL DEFAULT 10,
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+    `);
+  }
+
+  if (!existingSet.has('payment_transactions')) {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        order_number TEXT NOT NULL,
+        tx_kind TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        payer_role TEXT NOT NULL DEFAULT 'customer',
+        recipient_role TEXT NOT NULL DEFAULT 'platform_restaurant',
+        payment_method TEXT NOT NULL DEFAULT 'bkash',
+        amount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        gateway_tx_id TEXT DEFAULT '',
+        rider_uid TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+    `);
+  }
+
+  if (!existingSet.has('rider_wallet_ledger')) {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS rider_wallet_ledger (
+        id SERIAL PRIMARY KEY,
+        rider_uid TEXT NOT NULL,
+        order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+        order_number TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        cash_collected INTEGER NOT NULL DEFAULT 0,
+        rider_earning_delta INTEGER NOT NULL DEFAULT 0,
+        commission_owed_delta INTEGER NOT NULL DEFAULT 0,
+        commission_settled_delta INTEGER NOT NULL DEFAULT 0,
+        reference_id TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
     `);
   }

@@ -69,8 +69,17 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
   }
 
   if (!res.ok) {
+    const rawErr = data?.error as unknown;
+    const extractedErr =
+      typeof rawErr === 'string'
+        ? rawErr
+        : rawErr && typeof rawErr === 'object' && typeof (rawErr as { message?: unknown }).message === 'string'
+        ? String((rawErr as { message: string }).message)
+        : typeof data?.message === 'string'
+        ? data.message
+        : '';
     const snippet = rawText && !rawText.trim().startsWith('<') ? rawText.trim().slice(0, 180) : '';
-    throw new Error(data.error || snippet || `Request failed (${res.status})`);
+    throw new Error(extractedErr || snippet || `Request failed (${res.status})`);
   }
   return data as T;
 }

@@ -1,13 +1,20 @@
 import {
+  buildOsrmDirectionInstruction,
   cleanMapAddressSegments,
   expandAddressSearchQueries,
   filterAndRankRemoteSuggestions,
   findLocalAddressSuggestions,
+  getDeliveryVehicleMeta,
   haversineDistanceKm,
   isWithinBangladesh,
   mapOpenMeteoWeather,
   matchCanonicalAreaFromHints,
   mergeAddressSuggestions,
+  normalizeDeliveryVehicleMode,
+  summarizeTrafficCongestion,
+  type DeliveryVehicleMode,
+  type LiveRouteTrafficSummary,
+  type RouteDirectionStep,
 } from '../lib/marketplace-logic.ts';
 import { BANGLADESH_AREAS, BANGLADESH_SEARCH_PLACES } from '../lib/i18n.ts';
 
@@ -402,37 +409,137 @@ export interface OsrmRouteEstimate {
   distanceKm: number;
   drivingMinutes: number;
   source: 'OSRM' | 'Haversine';
+  coordinates?: Array<{ lat: number; lng: number }>;
+  steps?: RouteDirectionStep[];
+  trafficSummary?: LiveRouteTrafficSummary;
 }
 
 export async function fetchOsrmRoute(
   fromLat: number,
   fromLng: number,
   toLat: number,
-  toLng: number
+  toLng: number,
+  options?: { includeSteps?: boolean; vehicleMode?: DeliveryVehicleMode | string }
 ): Promise<OsrmRouteEstimate> {
-  const key = `osrm:${fromLat.toFixed(3)},${fromLng.toFixed(3)}->${toLat.toFixed(3)},${toLng.toFixed(3)}`;
+  const includeSteps = Boolean(options?.includeSteps);
+  const vehicleMode: DeliveryVehicleMode = options?.vehicleMode
+    ? normalizeDeliveryVehicleMode(String(options.vehicleMode))
+    : 'car';
+  const vehicleMeta = getDeliveryVehicleMeta(vehicleMode);
+  const key = `osrm:${includeSteps ? 'full' : 'min'}:${vehicleMode}:${fromLat.toFixed(3)},${fromLng.toFixed(3)}->${toLat.toFixed(3)},${toLng.toFixed(3)}`;
   const cached = getCached<OsrmRouteEstimate>(key);
   if (cached) return cached;
 
   try {
-    const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=false`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(3500) });
-    if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
-    const data = (await res.json()) as {
-      code?: string;
-      routes?: Array<{ distance: number; duration: number }>;
+    const query = includeSteps
+      ? 'overview=full&geometries=geojson&steps=true'
+      : 'overview=false';
+    const tryOsrmProfile = async (profile: 'cycling' | 'driving' | 'foot') => {
+      const url = `https://router.project-osrm.org/route/v1/${profile}/${fromLng},${fromLat};${toLng},${toLat}?${query}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
+      return (await res.json()) as {
+        code?: string;
+        routes?: Array<{
+          distance: number;
+          duration: number;
+          geometry?: { coordinates?: Array<[number, number]> };
+          legs?: Array<{
+            steps?: Array<{
+              distance?: number;
+              duration?: number;
+              name?: string;
+              maneuver?: { type?: string; modifier?: string };
+            }>;
+          }>;
+        }>;
+      };
     };
-    const route = data.routes?.[0];
+
+    let usedProfile: 'cycling' | 'driving' | 'foot' = vehicleMeta.osrmProfile;
+    let data = await tryOsrmProfile(usedProfile).catch(async () => {
+      if (usedProfile !== 'driving') {
+        usedProfile = 'driving';
+        return tryOsrmProfile('driving');
+      }
+      throw new Error('OSRM unavailable');
+    });
+    let route = data.routes?.[0];
+    if (!route && usedProfile !== 'driving') {
+      usedProfile = 'driving';
+      data = await tryOsrmProfile('driving');
+      route = data.routes?.[0];
+    }
     if (!route) throw new Error('No OSRM route');
     const distanceKm = Math.round((route.distance / 1000) * 100) / 100;
-    const drivingMinutes = Math.max(5, Math.round(route.duration / 60));
-    return setCached(key, { distanceKm, drivingMinutes, source: 'OSRM' }, 5 * 60 * 1000);
+    const routeMatchesVehicle = usedProfile === vehicleMeta.osrmProfile;
+
+    const steps: RouteDirectionStep[] = includeSteps
+      ? (route.legs || [])
+          .flatMap((leg) => leg.steps || [])
+          .map((st) => ({
+            instruction: buildOsrmDirectionInstruction({
+              type: st.maneuver?.type,
+              modifier: st.maneuver?.modifier,
+              roadName: st.name,
+            }),
+            distanceMeters: Number(st.distance || 0),
+            durationSeconds: Number(st.duration || 0),
+            maneuver: st.maneuver?.type,
+            roadName: st.name || undefined,
+          }))
+      : [];
+
+    const trafficSummary = summarizeTrafficCongestion({
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      staticDurationSeconds: route.duration,
+      steps,
+      source: 'osrm',
+      vehicleMode,
+      routeMatchesVehicle,
+    });
+
+    if (!includeSteps) {
+      return setCached(
+        key,
+        { distanceKm, drivingMinutes: trafficSummary.etaMinutes, source: 'OSRM' },
+        5 * 60 * 1000
+      );
+    }
+
+    const coordinates = (route.geometry?.coordinates || [])
+      .filter((pt) => Array.isArray(pt) && pt.length >= 2 && Number.isFinite(pt[0]) && Number.isFinite(pt[1]))
+      .map(([lng, lat]) => ({ lat, lng }));
+
+    return setCached(
+      key,
+      {
+        distanceKm,
+        drivingMinutes: trafficSummary.etaMinutes,
+        source: 'OSRM',
+        coordinates,
+        steps,
+        trafficSummary,
+      },
+      5 * 60 * 1000
+    );
   } catch {
     const distanceKm = haversineDistanceKm(fromLat, fromLng, toLat, toLng);
+    const estDurationSec = Math.max(360, Math.round(distanceKm * 252));
+    const trafficSummary = summarizeTrafficCongestion({
+      distanceMeters: Math.round(distanceKm * 1000),
+      durationSeconds: estDurationSec,
+      staticDurationSeconds: estDurationSec,
+      source: 'estimated',
+      vehicleMode,
+      routeMatchesVehicle: false,
+    });
     return {
       distanceKm,
-      drivingMinutes: Math.max(6, Math.round(distanceKm * 4.2)),
+      drivingMinutes: trafficSummary.etaMinutes,
       source: 'Haversine',
+      ...(includeSteps ? { trafficSummary, steps: [] } : {}),
     };
   }
 }

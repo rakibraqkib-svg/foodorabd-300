@@ -37,18 +37,36 @@ import {
   calculateLiveRiderEta,
   calculateRiderLegEtaMin,
   calculateRiderProfileStats,
+  calculateSplitOrderFinancials,
+  canRiderAcceptOrders,
+  DEFAULT_DELIVERY_FINANCIAL_CONFIG,
+  type DeliveryFinancialConfig,
   detectOrderBatchChanges,
+  DHAKA_ZONE_PRESETS,
   formatBdt,
+  formatDurationEstimate,
   formatRiderShortOrderCode,
   isBicycleVehicleType,
   resolveRiderCashCollectAmount,
+  haversineDistanceKm,
+  formatDirectionStepDistance,
   sanitizeRiderProfileUpdate,
   VEHICLE_TYPE_PRESET_OPTIONS,
+  type LiveRouteTrafficSummary,
 } from '../lib/marketplace-logic';
 import { emitLocalRealtimeSignal, playOrderAlertChime, useRealtimeEvents } from '../lib/realtime';
 import { DhakaMapPicker } from './DhakaMapPicker';
 import { SelectWithCustom } from './SelectWithCustom';
-import type { AppUser, Lang, OrderRecord, RiderJob, RiderRecord } from '../types/marketplace';
+import type {
+  AppUser,
+  DhakaZoneCoverageItem,
+  Lang,
+  OrderRecord,
+  RiderJob,
+  RiderRecord,
+  RiderWalletLedgerEntry,
+  RiderWalletSummary,
+} from '../types/marketplace';
 
 interface RiderDashboardProps {
   user: AppUser | null;
@@ -74,6 +92,21 @@ export function RiderDashboard({
   const [rider, setRider] = useState<RiderRecord | null>(null);
   const [availableOrders, setAvailableOrders] = useState<OrderRecord[]>([]);
   const [assignedOrders, setAssignedOrders] = useState<OrderRecord[]>([]);
+  const [walletSummary, setWalletSummary] = useState<RiderWalletSummary>({
+    totalCashCollected: 0,
+    totalRiderEarnings: 0,
+    totalCommissionOwed: 0,
+    totalCommissionSettled: 0,
+    outstandingCommission: 0,
+    deliveredCountFromLedger: 0,
+  });
+  const [walletLedger, setWalletLedger] = useState<RiderWalletLedgerEntry[]>([]);
+  const [settlementRules, setSettlementRules] = useState<
+    DeliveryFinancialConfig['settlementRules']
+  >(DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules);
+  const [deliveryFinancialConfig, setDeliveryFinancialConfig] =
+    useState<DeliveryFinancialConfig>(DEFAULT_DELIVERY_FINANCIAL_CONFIG);
+  const [zoneCoverage, setZoneCoverage] = useState<DhakaZoneCoverageItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [showJobForm, setShowJobForm] = useState(initialOnboarding);
@@ -99,9 +132,12 @@ export function RiderDashboard({
   const [editingCashOrderId, setEditingCashOrderId] = useState<number | null>(null);
   const [editedCashInput, setEditedCashInput] = useState('');
   const [cashCollectOverrideByOrder, setCashCollectOverrideByOrder] = useState<Record<number, number>>({});
+  const [cashConfirmedByOrder, setCashConfirmedByOrder] = useState<Record<number, boolean>>({});
   const [proofPhotoByOrder, setProofPhotoByOrder] = useState<Record<number, string>>({});
   const [uploadingProofOrderId, setUploadingProofOrderId] = useState<number | null>(null);
   const [proofUploadError, setProofUploadError] = useState<string | null>(null);
+  const [liveRouteSummary, setLiveRouteSummary] = useState<LiveRouteTrafficSummary | null>(null);
+  const [sheetStepsOpen, setSheetStepsOpen] = useState(false);
   const proofFileInputRef = useRef<HTMLInputElement | null>(null);
   const riderSheetRef = useRef<HTMLDivElement | null>(null);
 
@@ -201,6 +237,11 @@ export function RiderDashboard({
           rider: RiderRecord | null;
           availableOrders: OrderRecord[];
           assignedOrders: OrderRecord[];
+          walletSummary?: RiderWalletSummary;
+          walletLedger?: RiderWalletLedgerEntry[];
+          settlementRules?: DeliveryFinancialConfig['settlementRules'];
+          deliveryFinancialConfig?: DeliveryFinancialConfig;
+          zoneCoverage?: DhakaZoneCoverageItem[];
         }>('/api/rider/workspace');
 
         const availChanges = detectOrderBatchChanges(
@@ -246,6 +287,11 @@ export function RiderDashboard({
         setRider(res.rider);
         setAvailableOrders(res.availableOrders);
         setAssignedOrders(res.assignedOrders);
+        if (res.walletSummary) setWalletSummary(res.walletSummary);
+        if (res.walletLedger) setWalletLedger(res.walletLedger);
+        if (res.settlementRules) setSettlementRules(res.settlementRules);
+        if (res.deliveryFinancialConfig) setDeliveryFinancialConfig(res.deliveryFinancialConfig);
+        if (res.zoneCoverage) setZoneCoverage(res.zoneCoverage);
       } catch (err) {
         console.error('Failed to load rider workspace:', err);
       } finally {
@@ -850,18 +896,76 @@ export function RiderDashboard({
           >
             <div>
               <p className="text-xs font-semibold text-[#E21B70]">
-                {lang === 'bn' ? 'রাইডার জব · সারা বাংলাদেশ' : 'Delivery Rider Onboarding · All Bangladesh'}
+                {lang === 'bn'
+                  ? 'ঢাকা জোন-ভিত্তিক স্বতন্ত্র রাইডার নেটওয়ার্ক · অ্যাডমিন অনুমোদন'
+                  : 'Dhaka Zone Independent Rider Network · Admin Approved'}
               </p>
               <h1 className="text-2xl font-bold text-[#2E3138] mt-1">
                 {lang === 'bn'
-                  ? 'Foodora BD ডেলিভারি রাইডার জবে যোগ দিন'
-                  : 'Join Foodora BD Delivery Fleet Anywhere in Bangladesh'}
+                  ? 'Foodora BD রাইডার নেটওয়ার্কে আবেদন করুন'
+                  : 'Join Foodora BD Delivery Fleet — Choose Your Dhaka Zone'}
               </h1>
               <p className="text-xs text-neutral-500 mt-1">
                 {lang === 'bn'
-                  ? 'ঢাকা, চট্টগ্রাম, সিলেট, রাজশাহী, খুলনা, বরিশাল, রংপুর, ময়মনসিংহ বা যেকোনো জেলা থেকে জব জয়েন করুন।'
-                  : 'Apply from any district or area in Bangladesh and start receiving live delivery dispatches immediately.'}
+                  ? 'আপনার ঢাকার এলাকা বা বাংলাদেশের যেকোনো জোন নির্বাচন করে আবেদন করুন। অ্যাডমিন অনুমোদনের পর সরাসরি ডেলিভারি ও ক্যাশ আয় শুরু হবে।'
+                  : 'Select your Dhaka zone or operating area and apply. Once Admin approves your zone application, start accepting orders and earning per delivery.'}
               </p>
+              <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-2.5 py-1.5 font-semibold text-emerald-900">
+                  ✓ {lang === 'bn' ? 'কোনো জয়েনিং ফি নেই' : 'No Joining Fee'}
+                </div>
+                <div className="rounded-lg bg-purple-50 border border-purple-200 px-2.5 py-1.5 font-semibold text-purple-900">
+                  ✓ {lang === 'bn' ? 'প্রতি ডেলিভারিতে আয়' : 'Earn Per Delivery'}
+                </div>
+                <div className="rounded-lg bg-amber-50 border border-amber-200 px-2.5 py-1.5 font-semibold text-amber-900">
+                  ✓ {lang === 'bn' ? 'কাস্টমার থেকে ক্যাশ' : 'Cash Delivery Fee'}
+                </div>
+                <div className="rounded-lg bg-pink-50 border border-pink-200 px-2.5 py-1.5 font-semibold text-[#E21B70]">
+                  ✓ {lang === 'bn' ? 'স্বচ্ছ কমিশন ওয়ালেট' : 'Transparent Wallet'}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-neutral-700 mb-1.5">
+                {lang === 'bn'
+                  ? 'ঢাকা জোন দ্রুত নির্বাচন করুন (ZONE 01 – ZONE 12)'
+                  : 'Quick Select Dhaka Operating Zone (ZONE 01 – ZONE 12)'}
+              </label>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                {DHAKA_ZONE_PRESETS.map((z) => {
+                  const zoneValue = z.label;
+                  const active =
+                    zone.toLowerCase() === zoneValue.toLowerCase() ||
+                    zone.toLowerCase().includes(z.name.toLowerCase());
+                  const matchedArea = BANGLADESH_AREAS.find((a) =>
+                    a.name.toLowerCase().includes(z.name.split('/')[0].trim().toLowerCase())
+                  );
+                  return (
+                    <button
+                      key={z.code}
+                      type="button"
+                      onClick={() => {
+                        setZone(zoneValue);
+                        setCustomZone('');
+                        if (matchedArea) {
+                          setApplyCoords({ lat: matchedArea.lat, lng: matchedArea.lng });
+                        }
+                      }}
+                      className={`px-2.5 py-1.5 rounded-lg border text-left text-[11px] font-semibold transition-colors ${
+                        active
+                          ? 'border-[#E21B70] bg-[#FFF0F6] text-[#E21B70]'
+                          : 'border-neutral-200 bg-neutral-50 text-neutral-700 hover:border-neutral-300'
+                      }`}
+                    >
+                      <span className="block font-bold truncate">{z.code}</span>
+                      <span className="block text-[10px] opacity-85 truncate">
+                        {lang === 'bn' ? z.nameBn : z.name}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1052,10 +1156,10 @@ export function RiderDashboard({
               {registering
                 ? lang === 'bn'
                   ? 'আবেদন জমা হচ্ছে...'
-                  : 'Activating Rider Job...'
+                  : 'Submitting Application...'
                 : lang === 'bn'
-                ? 'রাইডার জব জয়েন ও সক্রিয় করুন'
-                : 'Apply & Activate Rider Job Now'}
+                ? 'রাইডার আবেদন জমা দিন (অ্যাডমিন অনুমোদন)'
+                : 'Submit Rider Application (Admin Review)'}
             </button>
           </form>
         </div>
@@ -1179,7 +1283,7 @@ export function RiderDashboard({
               {rider && (
                 <button
                   type="button"
-                  disabled={syncingLoc}
+                  disabled={syncingLoc || rider.status !== 'approved'}
                   onClick={() =>
                     persistRiderLocation(
                       {
@@ -1196,7 +1300,7 @@ export function RiderDashboard({
                         : 'You are now Offline.'
                     )
                   }
-                  className={`px-4 py-2.5 rounded-xl text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
+                  className={`px-4 py-2.5 rounded-xl text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 ${
                     rider.isAvailable
                       ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
                       : 'bg-[#2E3138] text-white border-[#2E3138] hover:bg-black'
@@ -1247,6 +1351,54 @@ export function RiderDashboard({
               )}
             </div>
           </div>
+
+          {/* Pending Approval / Suspended / Outstanding Commission Gate Banner */}
+          {rider && (() => {
+            const riderGate = canRiderAcceptOrders({
+              riderStatus: rider.status,
+              outstandingCommission: walletSummary.outstandingCommission,
+              settlementRules,
+            });
+            if (riderGate.allowed) return null;
+            const isPending = rider.status === 'pending';
+            const isSuspended = rider.status === 'suspended';
+            return (
+              <div
+                data-testid="rider-dispatch-gate-banner"
+                className={`rounded-2xl border p-4 flex flex-wrap items-center justify-between gap-3 ${
+                  isSuspended
+                    ? 'bg-red-50 border-red-200 text-red-900'
+                    : 'bg-amber-50 border-amber-300 text-amber-950'
+                }`}
+              >
+                <div className="space-y-1">
+                  <p className="text-sm font-bold">
+                    {isPending
+                      ? lang === 'bn'
+                        ? `অ্যাডমিন অনুমোদনের অপেক্ষায় · জোন: ${rider.zone}`
+                        : `Application Pending Admin Approval — Zone: ${rider.zone}`
+                      : isSuspended
+                      ? lang === 'bn'
+                        ? 'আপনার রাইডার অ্যাকাউন্ট স্থগিত আছে'
+                        : 'Rider Account Suspended'
+                      : lang === 'bn'
+                      ? 'বকেয়া কমিশন সীমা অতিক্রম করেছে'
+                      : 'Commission Settlement Required Before Next Dispatch'}
+                  </p>
+                  <p className="text-xs opacity-90">{riderGate.reason}</p>
+                </div>
+                {!isPending && !isSuspended && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('earnings')}
+                    className="px-3.5 py-2 rounded-lg bg-[#2E3138] text-white text-xs font-bold shrink-0"
+                  >
+                    {lang === 'bn' ? 'ওয়ালেট ও কমিশন দেখুন' : 'View Commission Wallet'}
+                  </button>
+                )}
+              </div>
+            );
+          })()}
 
           {/* 4-Column Tabular KPI Strip */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5 tabular-nums">
@@ -1422,6 +1574,23 @@ export function RiderDashboard({
                 )
               : 18;
 
+            const activeTargetCoords = isPickupStage ? vendorCoords : customerCoords;
+            const activeLegDistanceKm = displayOrder
+              ? Math.round(
+                  haversineDistanceKm(
+                    riderCoords.lat,
+                    riderCoords.lng,
+                    activeTargetCoords.lat,
+                    activeTargetCoords.lng
+                  ) * 100
+                ) / 100
+              : null;
+            const activeLegEtaMin = displayOrder
+              ? isPickupStage
+                ? pickupEtaMin
+                : dropoffEtaMin
+              : null;
+
             const navigateUrl = displayOrder
               ? isPickupStage
                 ? `https://www.google.com/maps/dir/?api=1&destination=${vendorCoords.lat},${vendorCoords.lng}`
@@ -1439,9 +1608,44 @@ export function RiderDashboard({
               ? resolveRiderCashCollectAmount(
                   displayOrder.paymentMethod,
                   displayOrder.totalAmount,
-                  editedCash
+                  editedCash,
+                  {
+                    paymentSplitMode: displayOrder.paymentSplitMode,
+                    cashDueToRider: displayOrder.cashDueToRider,
+                  }
                 )
               : null;
+            const riderAcceptGate =
+              user?.role === 'admin' || user?.role === 'super_admin'
+                ? { allowed: true }
+                : canRiderAcceptOrders({
+                    riderStatus: rider?.status || 'pending',
+                    outstandingCommission: walletSummary.outstandingCommission,
+                    settlementRules,
+                  });
+            const displayOrderFinancials = displayOrder
+              ? calculateSplitOrderFinancials({
+                  subtotal: displayOrder.subtotal,
+                  discountAmount: displayOrder.discountAmount,
+                  deliveryFee: displayOrder.deliveryFee,
+                  serviceFee: displayOrder.serviceFee,
+                  taxAmount: displayOrder.taxAmount,
+                  commissionType: 'percentage',
+                  commissionRate: 15,
+                  fixedCommission: 0,
+                  paymentMethod: displayOrder.paymentMethod,
+                  riderEarningRule: deliveryFinancialConfig.riderEarningRule,
+                })
+              : null;
+            const offerRiderEarning =
+              displayOrder?.riderEarningAmount ??
+              displayOrderFinancials?.riderEarningAmount ??
+              0;
+            const offerFoodoraCommission =
+              displayOrder?.foodoraDeliveryCommission ??
+              displayOrderFinancials?.foodoraDeliveryCommission ??
+              0;
+            const offerCashCollect = cashInfo?.amountToCollect ?? displayOrder?.deliveryFee ?? 0;
             const uploadedProof = displayOrder ? proofPhotoByOrder[displayOrder.id] : undefined;
             const pickupRating = displayOrder ? pickupRatingByOrder[displayOrder.id] : undefined;
 
@@ -1491,6 +1695,14 @@ export function RiderDashboard({
                         label: rider?.fullName || 'You',
                       }}
                       riderTarget={isPickupStage ? vendorCoords : customerCoords}
+                      riderVehicleType={rider?.vehicleType}
+                      liveDistanceKm={activeLegDistanceKm}
+                      liveEtaMinutes={activeLegEtaMin}
+                      trackingStatus={displayOrder?.status}
+                      showTraffic
+                      showDirectionsSummary
+                      onRouteSummary={setLiveRouteSummary}
+                      telemetryBadgeClassName="absolute top-14 left-3"
                       heightClass="h-[250px] sm:h-[280px] !rounded-none !border-0"
                     />
 
@@ -1616,16 +1828,45 @@ export function RiderDashboard({
                     {/* -------- STATE 1: INCOMING OFFER SHEET (Screenshot_1 & Screenshot_11) -------- */}
                     {sheetMode === 'offer' && displayOrder && (
                       <div className="space-y-4">
-                        <div className="text-center pt-1 pb-2 border-b border-neutral-100">
-                          <p className="text-3xl font-extrabold text-[#16A34A] tabular-nums tracking-tight">
-                            {Math.max(40, displayOrder.deliveryFee).toFixed(2)} Tk
+                        <div className="text-center pt-1 pb-3 border-b border-neutral-100 space-y-1.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                            {sheetBn ? 'আপনার রাইডার আয়' : 'Your Rider Earning'}
                           </p>
-                          <p className="text-[11px] font-semibold text-neutral-500 mt-0.5">
+                          <p className="text-3xl font-extrabold text-[#16A34A] tabular-nums tracking-tight">
+                            +{formatBdt(offerRiderEarning, lang)}
+                          </p>
+                          <p className="text-[11px] font-semibold text-neutral-500">
                             {displayOrder.orderNumber} ·{' '}
                             {displayOrder.paymentMethod === 'cod'
-                              ? `COD (${displayOrder.totalAmount} Tk)`
-                              : `Paid Online`}
+                              ? `COD (${formatBdt(displayOrder.totalAmount, lang)})`
+                              : displayOrder.paymentStatus === 'paid'
+                              ? sheetBn
+                                ? 'খাবারের দাম অনলাইনে পরিশোধিত'
+                                : 'Food Paid Online'
+                              : sheetBn
+                              ? 'অনলাইন পেমেন্ট বাকি'
+                              : 'Prepaid Verification Pending'}
                           </p>
+                          <div className="grid grid-cols-3 gap-1.5 pt-1 text-[11px] tabular-nums">
+                            <div className="rounded-lg bg-amber-50 border border-amber-200 px-2 py-1 text-amber-900">
+                              <span className="block text-[10px] opacity-80">
+                                {sheetBn ? 'ক্যাশ সংগ্রহ' : 'Collect Cash'}
+                              </span>
+                              <span className="font-bold">{formatBdt(offerCashCollect, lang)}</span>
+                            </div>
+                            <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-2 py-1 text-emerald-900">
+                              <span className="block text-[10px] opacity-80">
+                                {sheetBn ? 'আপনার আয়' : 'Rider Share'}
+                              </span>
+                              <span className="font-bold">{formatBdt(offerRiderEarning, lang)}</span>
+                            </div>
+                            <div className="rounded-lg bg-purple-50 border border-purple-200 px-2 py-1 text-purple-900">
+                              <span className="block text-[10px] opacity-80">
+                                {sheetBn ? 'Foodora কমিশন' : 'Foodora Fee'}
+                              </span>
+                              <span className="font-bold">{formatBdt(offerFoodoraCommission, lang)}</span>
+                            </div>
+                          </div>
                         </div>
 
                         <div className="space-y-3 text-xs">
@@ -1679,10 +1920,20 @@ export function RiderDashboard({
                           </div>
                         </div>
 
-                        <div className="pt-1 border-t-2 border-amber-500">
+                        <div className="pt-1 border-t-2 border-amber-500 space-y-2">
+                          {!riderAcceptGate.allowed && (
+                            <p className="text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                              {riderAcceptGate.reason}
+                            </p>
+                          )}
                           <button
                             type="button"
-                            disabled={acceptingOrderId === displayOrder.id}
+                            disabled={
+                              acceptingOrderId === displayOrder.id ||
+                              !riderAcceptGate.allowed ||
+                              (displayOrder.paymentMethod !== 'cod' &&
+                                displayOrder.paymentStatus !== 'paid')
+                            }
                             onClick={() => {
                               setPreviewOfferMode(false);
                               void handleAcceptOrder(displayOrder.id);
@@ -1710,11 +1961,25 @@ export function RiderDashboard({
                             <h2 className="text-lg font-bold text-[#2E3138] truncate">
                               {displayOrder.restaurantName}
                             </h2>
-                            <p className="text-xs font-semibold text-[#2E3138] mt-0.5">
+                            <p className="text-xs font-semibold text-[#2E3138] mt-0.5 tabular-nums">
                               {sheetBn
-                                ? `ভেন্ডরের দিকে যান • ${pickupEtaMin} মিনিটে পৌঁছাবেন`
-                                : `Go to vendor • Arrive in ${pickupEtaMin} min`}
+                                ? `ভেন্ডরের দিকে যান • ${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm) !== null ? `${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm)!.toFixed(1)} কিমি • ` : ''}${formatDurationEstimate(liveRouteSummary?.etaMinutes ?? pickupEtaMin, 'bn')}ে পৌঁছাবেন`
+                                : `Go to vendor • ${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm) !== null ? `${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm)!.toFixed(1)} km • ` : ''}Arrive in ${formatDurationEstimate(liveRouteSummary?.etaMinutes ?? pickupEtaMin, 'en', 'compact')}`}
                             </p>
+                            {liveRouteSummary && (
+                              <button
+                                type="button"
+                                onClick={() => setSheetStepsOpen((v) => !v)}
+                                className="mt-1 inline-flex items-center gap-1.5 text-[11px] font-bold text-[#1A73E8] hover:underline"
+                              >
+                                <span>
+                                  {sheetBn
+                                    ? `${liveRouteSummary.trafficLabelBn} · ${liveRouteSummary.steps.length} ধাপ`
+                                    : `${liveRouteSummary.trafficLabelEn} · ${liveRouteSummary.steps.length} turns`}
+                                </span>
+                                {sheetStepsOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                              </button>
+                            )}
                             <p className="text-xs text-neutral-500 mt-0.5">
                               {sheetBn ? '১টি অর্ডার পিকআপের জন্য' : '1 order for pickup'}
                             </p>
@@ -1738,6 +2003,23 @@ export function RiderDashboard({
                             </p>
                           </div>
                         </div>
+
+                        {sheetStepsOpen && liveRouteSummary && liveRouteSummary.steps.length > 0 && (
+                          <ol className="max-h-32 overflow-y-auto space-y-1 rounded-xl bg-neutral-50 border border-neutral-200 p-2.5 text-[11px]">
+                            {liveRouteSummary.steps.map((st, idx) => (
+                              <li key={idx} className="flex items-center justify-between gap-2 text-neutral-700">
+                                <span className="truncate">
+                                  <strong>{idx + 1}.</strong> {st.instruction}
+                                </span>
+                                {st.distanceMeters > 0 && (
+                                  <span className="text-[10px] font-semibold text-neutral-500 shrink-0">
+                                    {formatDirectionStepDistance(st.distanceMeters, sheetBn ? 'bn' : 'en')}
+                                  </span>
+                                )}
+                              </li>
+                            ))}
+                          </ol>
+                        )}
 
                         {/* Ready Status Pill & Order Code */}
                         <div className="space-y-2">
@@ -1883,11 +2165,25 @@ export function RiderDashboard({
                               <h2 className="text-lg font-bold text-[#2E3138] truncate">
                                 {displayOrder.customerName}
                               </h2>
-                              <p className="text-xs font-semibold text-[#2E3138] mt-0.5">
+                              <p className="text-xs font-semibold text-[#2E3138] mt-0.5 tabular-nums">
                                 {sheetBn
-                                  ? `ড্রপ-অফ • ${dropoffEtaMin} মিনিটে পৌঁছাবেন`
-                                  : `Drop-off • Arrive in ${dropoffEtaMin} min`}
+                                  ? `ড্রপ-অফ • ${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm) !== null ? `${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm)!.toFixed(1)} কিমি • ` : ''}${formatDurationEstimate(liveRouteSummary?.etaMinutes ?? dropoffEtaMin, 'bn')}ে পৌঁছাবেন`
+                                  : `Drop-off • ${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm) !== null ? `${(liveRouteSummary?.distanceKm ?? activeLegDistanceKm)!.toFixed(1)} km • ` : ''}Arrive in ${formatDurationEstimate(liveRouteSummary?.etaMinutes ?? dropoffEtaMin, 'en', 'compact')}`}
                               </p>
+                              {liveRouteSummary && (
+                                <button
+                                  type="button"
+                                  onClick={() => setSheetStepsOpen((v) => !v)}
+                                  className="mt-1 inline-flex items-center gap-1 text-[11px] font-bold text-[#1A73E8] hover:underline"
+                                >
+                                  <span>
+                                    {sheetBn
+                                      ? `${liveRouteSummary.trafficLabelBn} · ${liveRouteSummary.steps.length} ধাপ`
+                                      : `${liveRouteSummary.trafficLabelEn} · ${liveRouteSummary.steps.length} turns`}
+                                  </span>
+                                  {sheetStepsOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                                </button>
+                              )}
                               <p className="text-xs text-neutral-500 mt-0.5">
                                 #{shortCode} • {displayOrder.orderNumber}
                               </p>
@@ -1918,6 +2214,23 @@ export function RiderDashboard({
                             <p className="text-[11px] bg-amber-50 border border-amber-200 text-amber-800 px-2.5 py-1.5 rounded-lg">
                               {sheetBn ? 'নির্দেশনা:' : 'Note:'} {displayOrder.deliveryInstructions}
                             </p>
+                          )}
+
+                          {sheetStepsOpen && liveRouteSummary && liveRouteSummary.steps.length > 0 && (
+                            <ol className="max-h-32 overflow-y-auto space-y-1 rounded-xl bg-neutral-50 border border-neutral-200 p-2.5 text-[11px]">
+                              {liveRouteSummary.steps.map((st, idx) => (
+                                <li key={idx} className="flex items-center justify-between gap-2 text-neutral-700">
+                                  <span className="truncate">
+                                    <strong>{idx + 1}.</strong> {st.instruction}
+                                  </span>
+                                  {st.distanceMeters > 0 && (
+                                    <span className="text-[10px] font-semibold text-neutral-500 shrink-0">
+                                      {formatDirectionStepDistance(st.distanceMeters, sheetBn ? 'bn' : 'en')}
+                                    </span>
+                                  )}
+                                </li>
+                              ))}
+                            </ol>
                           )}
                         </div>
 
@@ -1971,97 +2284,161 @@ export function RiderDashboard({
                             </div>
                           )}
 
-                          {/* Payment Summary: Paid online OR Collect cash + Edit */}
-                          <div className="pt-2 border-t border-neutral-100 space-y-2 text-xs">
-                            <div className="flex items-center justify-between">
-                              <div>
-                                <p className="text-[11px] text-neutral-400">
-                                  {sheetBn ? 'পেমেন্ট' : 'Payment'}
-                                </p>
-                                <p className="font-semibold text-[#2E3138]">
-                                  {sheetBn ? cashInfo.statusLabelBn : cashInfo.statusLabelEn}
-                                </p>
-                              </div>
-                              <div className="text-right tabular-nums">
-                                <p className="font-bold text-[#2E3138]">
-                                  {cashInfo.isCod
-                                    ? `${cashInfo.amountToCollect.toFixed(2)} Tk`
-                                    : sheetBn
-                                    ? 'অনলাইনে পরিশোধিত'
-                                    : 'Paid online'}
-                                </p>
-                              </div>
-                            </div>
-
-                            {cashInfo.isCod && (
-                              <div className="pt-2 border-t border-neutral-100 space-y-1">
-                                <div className="flex items-center justify-between">
-                                  <span className="font-bold text-[#2E3138]">
-                                    {sheetBn ? 'মোট পেমেন্ট' : 'Total payment'}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      if (editingCashOrderId === displayOrder.id) {
-                                        setEditingCashOrderId(null);
-                                      } else {
-                                        setEditingCashOrderId(displayOrder.id);
-                                        setEditedCashInput(String(cashInfo.amountToCollect));
-                                      }
-                                    }}
-                                    className="font-bold text-[#E21B70] hover:underline"
-                                  >
-                                    {editingCashOrderId === displayOrder.id
-                                      ? sheetBn
-                                        ? 'বাতিল'
-                                        : 'Close'
-                                      : sheetBn
-                                      ? 'এডিট'
-                                      : 'Edit'}
-                                  </button>
-                                </div>
-
-                                {editingCashOrderId === displayOrder.id ? (
-                                  <div className="flex items-center gap-2 pt-1">
-                                    <input
-                                      type="number"
-                                      min={0}
-                                      step="1"
-                                      value={editedCashInput}
-                                      onChange={(e) => setEditedCashInput(e.target.value)}
-                                      className="flex-1 px-3 py-1.5 rounded-lg border border-neutral-200 text-sm font-bold tabular-nums"
-                                    />
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        const val = Number(editedCashInput);
-                                        if (Number.isFinite(val) && val >= 0) {
-                                          setCashCollectOverrideByOrder((prev) => ({
-                                            ...prev,
-                                            [displayOrder.id]: val,
-                                          }));
-                                        }
-                                        setEditingCashOrderId(null);
-                                      }}
-                                      className="px-3 py-1.5 rounded-lg bg-[#E21B70] text-white text-xs font-bold"
-                                    >
-                                      Save
-                                    </button>
+                          {/* Payment Summary: Online Paid (Food) + Cash to Rider (Delivery Charge) */}
+                          {(() => {
+                            const collectCashRequired =
+                              cashInfo.isCod || cashInfo.isDeliveryCashOnly;
+                            const needCashCheck =
+                              collectCashRequired &&
+                              (settlementRules?.requireCashConfirmation ?? true);
+                            const cashChecked = Boolean(cashConfirmedByOrder[displayOrder.id]);
+                            return (
+                              <>
+                                <div className="pt-2 border-t border-neutral-100 space-y-2 text-xs">
+                                  <div className="flex items-center justify-between">
+                                    <div>
+                                      <p className="text-[11px] text-neutral-400">
+                                        {sheetBn ? 'পেমেন্ট' : 'Payment'}
+                                      </p>
+                                      <p className="font-semibold text-[#2E3138]">
+                                        {sheetBn ? cashInfo.statusLabelBn : cashInfo.statusLabelEn}
+                                      </p>
+                                    </div>
+                                    <div className="text-right tabular-nums">
+                                      <p className="font-bold text-[#2E3138]">
+                                        {collectCashRequired
+                                          ? `${cashInfo.amountToCollect.toFixed(2)} Tk`
+                                          : sheetBn
+                                          ? 'অনলাইনে পরিশোধিত'
+                                          : 'Paid online'}
+                                      </p>
+                                    </div>
                                   </div>
-                                ) : (
-                                  <p className="text-xl font-extrabold text-[#2E3138] tabular-nums">
-                                    Tk {cashInfo.amountToCollect.toFixed(2)}
-                                  </p>
-                                )}
 
-                                <p className="text-[11px] text-neutral-500">
-                                  {sheetBn
-                                    ? 'কাস্টমারের কাছ থেকে ক্যাশ সংগ্রহ করুন'
-                                    : 'Collect cash from customer'}
-                                </p>
-                              </div>
-                            )}
-                          </div>
+                                  {cashInfo.isDeliveryCashOnly && (
+                                    <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-2.5 py-1.5 text-[11px] text-emerald-900 flex items-center justify-between">
+                                      <span className="font-semibold">
+                                        {sheetBn
+                                          ? 'খাবারের দাম অনলাইনে পরিশোধিত'
+                                          : 'Food Price Already Paid Online'}
+                                      </span>
+                                      <span className="font-bold tabular-nums">
+                                        {formatBdt(
+                                          displayOrder.onlineFoodPaidAmount ??
+                                            Math.max(
+                                              0,
+                                              displayOrder.totalAmount - displayOrder.deliveryFee
+                                            ),
+                                          lang
+                                        )}
+                                      </span>
+                                    </div>
+                                  )}
+
+                                  {collectCashRequired && (
+                                    <div className="pt-2 border-t border-neutral-100 space-y-1.5">
+                                      <div className="flex items-center justify-between">
+                                        <span className="font-bold text-[#2E3138]">
+                                          {cashInfo.isDeliveryCashOnly
+                                            ? sheetBn
+                                              ? 'রাইডারকে নগদ (ডেলিভারি চার্জ)'
+                                              : 'Pay Cash to Rider (Delivery Charge)'
+                                            : sheetBn
+                                            ? 'মোট ক্যাশ সংগ্রহ'
+                                            : 'Total payment'}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            if (editingCashOrderId === displayOrder.id) {
+                                              setEditingCashOrderId(null);
+                                            } else {
+                                              setEditingCashOrderId(displayOrder.id);
+                                              setEditedCashInput(String(cashInfo.amountToCollect));
+                                            }
+                                          }}
+                                          className="font-bold text-[#E21B70] hover:underline"
+                                        >
+                                          {editingCashOrderId === displayOrder.id
+                                            ? sheetBn
+                                              ? 'বাতিল'
+                                              : 'Close'
+                                            : sheetBn
+                                            ? 'এডিট'
+                                            : 'Edit'}
+                                        </button>
+                                      </div>
+
+                                      {editingCashOrderId === displayOrder.id ? (
+                                        <div className="flex items-center gap-2 pt-1">
+                                          <input
+                                            type="number"
+                                            min={0}
+                                            step="1"
+                                            value={editedCashInput}
+                                            onChange={(e) => setEditedCashInput(e.target.value)}
+                                            className="flex-1 px-3 py-1.5 rounded-lg border border-neutral-200 text-sm font-bold tabular-nums"
+                                          />
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const val = Number(editedCashInput);
+                                              if (Number.isFinite(val) && val >= 0) {
+                                                setCashCollectOverrideByOrder((prev) => ({
+                                                  ...prev,
+                                                  [displayOrder.id]: val,
+                                                }));
+                                              }
+                                              setEditingCashOrderId(null);
+                                            }}
+                                            className="px-3 py-1.5 rounded-lg bg-[#E21B70] text-white text-xs font-bold"
+                                          >
+                                            Save
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <p className="text-xl font-extrabold text-amber-900 tabular-nums">
+                                          Tk {cashInfo.amountToCollect.toFixed(2)}
+                                        </p>
+                                      )}
+
+                                      <div className="grid grid-cols-2 gap-1.5 text-[11px] tabular-nums pt-0.5">
+                                        <div className="rounded bg-emerald-50 border border-emerald-200 px-2 py-1 text-emerald-900">
+                                          {sheetBn ? 'রাইডার আয়:' : 'Rider earning:'}{' '}
+                                          <strong>{formatBdt(offerRiderEarning, lang)}</strong>
+                                        </div>
+                                        <div className="rounded bg-purple-50 border border-purple-200 px-2 py-1 text-purple-900">
+                                          {sheetBn ? 'Foodora কমিশন:' : 'Foodora owed:'}{' '}
+                                          <strong>{formatBdt(offerFoodoraCommission, lang)}</strong>
+                                        </div>
+                                      </div>
+
+                                      {needCashCheck && (
+                                        <label className="mt-1.5 flex items-start gap-2 p-2.5 rounded-lg bg-amber-50 border border-amber-300 text-[11px] font-semibold text-amber-950 cursor-pointer">
+                                          <input
+                                            type="checkbox"
+                                            checked={cashChecked}
+                                            onChange={(e) =>
+                                              setCashConfirmedByOrder((prev) => ({
+                                                ...prev,
+                                                [displayOrder.id]: e.target.checked,
+                                              }))
+                                            }
+                                            className="mt-0.5 accent-[#E21B70]"
+                                          />
+                                          <span>
+                                            {sheetBn
+                                              ? `আমি নিশ্চিত করছি কাস্টমারের কাছ থেকে ৳${cashInfo.amountToCollect} নগদ ডেলিভারি চার্জ সংগ্রহ করেছি।`
+                                              : `I confirm ৳${cashInfo.amountToCollect} cash delivery charge collected from customer.`}
+                                          </span>
+                                        </label>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              </>
+                            );
+                          })()}
                         </div>
 
                         {/* Proof of drop-Off (Screenshots 5, 6, 7) */}
@@ -2141,28 +2518,41 @@ export function RiderDashboard({
                           )}
 
                           {/* Primary Confirm Drop-off CTA */}
-                          <button
-                            type="button"
-                            disabled={updatingOrderId === displayOrder.id}
-                            onClick={() =>
-                              handleUpdateStatus(displayOrder.id, 'delivered', {
-                                pickupRating,
-                                proofPhotoUrl: uploadedProof,
-                                collectedCashAmount: cashInfo.isCod
-                                  ? cashInfo.amountToCollect
-                                  : undefined,
-                              })
-                            }
-                            className="w-full py-3.5 rounded-xl bg-[#E21B70] hover:bg-[#C4135E] text-white text-sm font-bold shadow-md disabled:opacity-50"
-                          >
-                            {updatingOrderId === displayOrder.id
-                              ? sheetBn
-                                ? 'সম্পন্ন হচ্ছে...'
-                                : 'Confirming drop-off...'
-                              : sheetBn
-                              ? 'ড্রপ-অফ কনফার্ম করুন'
-                              : 'Confirm drop-off'}
-                          </button>
+                          {(() => {
+                            const collectCashRequired =
+                              cashInfo.isCod || cashInfo.isDeliveryCashOnly;
+                            const needCashCheck =
+                              collectCashRequired &&
+                              (settlementRules?.requireCashConfirmation ?? true);
+                            const cashBlocked =
+                              needCashCheck && !cashConfirmedByOrder[displayOrder.id];
+                            return (
+                              <button
+                                type="button"
+                                disabled={
+                                  updatingOrderId === displayOrder.id || cashBlocked
+                                }
+                                onClick={() =>
+                                  handleUpdateStatus(displayOrder.id, 'delivered', {
+                                    pickupRating,
+                                    proofPhotoUrl: uploadedProof,
+                                    collectedCashAmount: collectCashRequired
+                                      ? cashInfo.amountToCollect
+                                      : undefined,
+                                  })
+                                }
+                                className="w-full py-3.5 rounded-xl bg-[#E21B70] hover:bg-[#C4135E] text-white text-sm font-bold shadow-md disabled:opacity-50"
+                              >
+                                {updatingOrderId === displayOrder.id
+                                  ? sheetBn
+                                    ? 'সম্পন্ন হচ্ছে...'
+                                    : 'Confirming drop-off...'
+                                  : sheetBn
+                                  ? 'ড্রপ-অফ কনফার্ম করুন'
+                                  : 'Confirm drop-off'}
+                              </button>
+                            );
+                          })()}
                         </div>
                       </div>
                     )}
@@ -2306,7 +2696,12 @@ export function RiderDashboard({
                                 </button>
                                 <button
                                   type="button"
-                                  disabled={accepting}
+                                  disabled={
+                                    accepting ||
+                                    !riderAcceptGate.allowed ||
+                                    (ord.paymentMethod !== 'cod' &&
+                                      ord.paymentStatus !== 'paid')
+                                  }
                                   onClick={() => {
                                     setPreviewOfferMode(false);
                                     void handleAcceptOrder(ord.id);
@@ -2499,6 +2894,22 @@ export function RiderDashboard({
                   lng: riderCoords.lng,
                   label: `${rider.fullName} (You)`,
                 }}
+                riderTarget={
+                  primaryActiveOrder &&
+                  !['on_the_way', 'picked_up'].includes(primaryActiveOrder.status) &&
+                  typeof primaryActiveOrder.restaurantLat === 'number' &&
+                  typeof primaryActiveOrder.restaurantLng === 'number'
+                    ? {
+                        lat: primaryActiveOrder.restaurantLat,
+                        lng: primaryActiveOrder.restaurantLng,
+                      }
+                    : undefined
+                }
+                riderVehicleType={rider?.vehicleType}
+                trackingStatus={primaryActiveOrder?.status}
+                showTraffic
+                showDirectionsSummary
+                enableInteractivePointRoute={!primaryActiveOrder}
                 interactive
                 heightClass="h-[340px]"
                 onSelectLocation={(loc) => {
@@ -2521,6 +2932,146 @@ export function RiderDashboard({
           {/* ---------------- TAB 3: HISTORY & EARNINGS ---------------- */}
           {activeTab === 'earnings' && (
             <section className="space-y-4">
+              {/* Transparent Cash Collection & Foodora Commission Wallet */}
+              <div
+                data-testid="rider-commission-wallet-section"
+                className="bg-white rounded-2xl border border-neutral-200 p-5 space-y-4"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-base font-bold text-[#2E3138] flex items-center gap-2">
+                      <Wallet className="w-4 h-4 text-[#E21B70]" />
+                      <span>
+                        {lang === 'bn'
+                          ? 'রাইডার ক্যাশ ও কমিশন ওয়ালেট'
+                          : 'Rider Cash & Foodora Commission Wallet'}
+                      </span>
+                    </h2>
+                    <p className="text-xs text-neutral-500 mt-0.5">
+                      {lang === 'bn'
+                        ? 'কাস্টমারের কাছ থেকে ডেলিভারি চার্জ নগদ সংগ্রহ করুন; Foodora প্ল্যাটফর্ম কমিশন স্বচ্ছভাবে এখানে ট্র্যাক করা হয়।'
+                        : 'Collect delivery charge directly in cash from customers; Foodora commission owed is transparently tracked here.'}
+                    </p>
+                  </div>
+                  <span className="px-2.5 py-1 rounded-lg bg-purple-50 border border-purple-200 text-[11px] font-semibold text-purple-900 tabular-nums">
+                    {lang === 'bn' ? 'সর্বোচ্চ বকেয়া সীমা:' : 'Max Limit:'}{' '}
+                    {formatBdt(settlementRules.maxOutstandingLimit, lang)}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 tabular-nums">
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                    <p className="text-[11px] font-semibold text-amber-800">
+                      {lang === 'bn' ? 'মোট সংগৃহীত ক্যাশ' : 'Total Cash Collected'}
+                    </p>
+                    <p className="text-lg font-bold text-amber-950 mt-0.5 font-mono">
+                      {formatBdt(walletSummary.totalCashCollected, lang)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+                    <p className="text-[11px] font-semibold text-emerald-800">
+                      {lang === 'bn' ? 'রাইডার আয়' : 'Rider Earnings'}
+                    </p>
+                    <p className="text-lg font-bold text-emerald-950 mt-0.5 font-mono">
+                      {formatBdt(walletSummary.totalRiderEarnings, lang)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-purple-200 bg-purple-50 p-3">
+                    <p className="text-[11px] font-semibold text-purple-800">
+                      {lang === 'bn' ? 'Foodora কমিশন' : 'Commission Owed'}
+                    </p>
+                    <p className="text-lg font-bold text-purple-950 mt-0.5 font-mono">
+                      {formatBdt(walletSummary.totalCommissionOwed, lang)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+                    <p className="text-[11px] font-semibold text-neutral-600">
+                      {lang === 'bn' ? 'জমা দেওয়া কমিশন' : 'Settled w/ Foodora'}
+                    </p>
+                    <p className="text-lg font-bold text-[#2E3138] mt-0.5 font-mono">
+                      {formatBdt(walletSummary.totalCommissionSettled, lang)}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-pink-200 bg-[#FFF0F6] p-3">
+                    <p className="text-[11px] font-semibold text-[#E21B70]">
+                      {lang === 'bn' ? 'বকেয়া কমিশন ব্যালেন্স' : 'Outstanding Owed'}
+                    </p>
+                    <p className="text-lg font-bold text-[#E21B70] mt-0.5 font-mono">
+                      {formatBdt(walletSummary.outstandingCommission, lang)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl bg-neutral-50 border border-neutral-200 p-3 text-xs text-neutral-700">
+                  <p className="font-semibold text-[#2E3138]">
+                    {lang === 'bn'
+                      ? 'কোনো অটোমেটেড পেআউট নেই — সরাসরি অ্যাডমিনের সাথে কমিশন সেটেল করুন'
+                      : 'No automated payouts for cash collected directly from customers — settle owed Foodora commission with Admin manually'}
+                  </p>
+                  <p className="text-[11px] text-neutral-500 mt-0.5">
+                    {settlementRules.settlementInstructions}
+                  </p>
+                </div>
+
+                {walletLedger.length > 0 && (
+                  <div className="overflow-x-auto border border-neutral-200 rounded-xl">
+                    <table className="w-full text-xs text-left">
+                      <thead className="bg-neutral-50 text-neutral-500 uppercase text-[10px]">
+                        <tr>
+                          <th className="px-3 py-2">Type</th>
+                          <th className="px-3 py-2">Order / Ref</th>
+                          <th className="px-3 py-2 text-right">Cash</th>
+                          <th className="px-3 py-2 text-right">Rider Share</th>
+                          <th className="px-3 py-2 text-right">Commission +/-</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-neutral-100 tabular-nums">
+                        {walletLedger.map((entry) => (
+                          <tr key={entry.id}>
+                            <td className="px-3 py-2 font-semibold capitalize text-[#2E3138]">
+                              {entry.entryType.replace(/_/g, ' ')}
+                            </td>
+                            <td className="px-3 py-2 text-neutral-600 font-mono">
+                              {entry.orderNumber || entry.referenceId || `#${entry.id}`}
+                              {entry.note ? (
+                                <span className="block font-sans text-[10px] text-neutral-400">
+                                  {entry.note}
+                                </span>
+                              ) : null}
+                            </td>
+                            <td className="px-3 py-2 text-right">
+                              {formatBdt(entry.cashCollected, lang)}
+                            </td>
+                            <td className="px-3 py-2 text-right font-semibold text-emerald-700">
+                              {entry.riderEarningDelta >= 0 ? '+' : ''}
+                              {formatBdt(entry.riderEarningDelta, lang)}
+                            </td>
+                            <td className="px-3 py-2 text-right font-semibold">
+                              {entry.commissionSettledDelta > 0 ? (
+                                <span className="text-emerald-700">
+                                  -{formatBdt(entry.commissionSettledDelta, lang)} (Settled)
+                                </span>
+                              ) : (
+                                <span
+                                  className={
+                                    entry.commissionOwedDelta > 0
+                                      ? 'text-purple-800'
+                                      : 'text-neutral-500'
+                                  }
+                                >
+                                  {entry.commissionOwedDelta >= 0 ? '+' : ''}
+                                  {formatBdt(entry.commissionOwedDelta, lang)}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5 tabular-nums">
                 <div className="bg-white rounded-xl border border-neutral-200 p-4">
                   <p className="text-xs text-neutral-500">
@@ -2603,10 +3154,11 @@ export function RiderDashboard({
                         <div className="flex items-center gap-3 tabular-nums">
                           <div className="text-right">
                             <p className="text-xs font-bold text-[#E21B70] font-mono">
-                              +{formatBdt(Math.max(40, ord.deliveryFee), lang)}
+                              +{formatBdt(ord.riderEarningAmount ?? Math.max(40, ord.deliveryFee), lang)}
                             </p>
                             <p className="text-[11px] text-neutral-500">
-                              Order {formatBdt(ord.totalAmount, lang)}
+                              Cash {formatBdt(ord.cashDueToRider ?? ord.deliveryFee, lang)} · Order{' '}
+                              {formatBdt(ord.totalAmount, lang)}
                             </p>
                           </div>
                           <button

@@ -171,6 +171,14 @@ export interface OrderRecord {
   restaurantAddress?: string;
   restaurantPhone?: string;
   estimatedMinutes: number;
+  paymentSplitMode?: string;
+  onlineFoodPaidAmount?: number;
+  cashDueToRider?: number;
+  riderEarningAmount?: number;
+  foodoraDeliveryCommission?: number;
+  cashCollectionStatus?: 'pending' | 'collected' | 'reversed' | string;
+  cashCollectedAmount?: number;
+  cashCollectedAt?: string | null;
   itemsSnapshotJson: OrderSnapshotItem[];
   createdAt: string;
 }
@@ -234,6 +242,7 @@ export interface RiderRecord {
   totalDeliveries: number;
   totalEarnings: number;
   createdAt?: string;
+  walletSummary?: RiderWalletSummary;
 }
 
 export interface OrderEmailLog {
@@ -339,6 +348,7 @@ export interface PlatformSettings {
   sslcommerzEnabled: boolean;
   sslcommerzSandbox: boolean;
   storefrontConfig?: Partial<StorefrontConfig> | null;
+  deliveryFinancialConfig?: import('../lib/marketplace-logic').DeliveryFinancialConfig | null;
 }
 
 export interface NotificationItem {
@@ -491,6 +501,63 @@ export interface AdminAiProvider extends PublicAiProvider {
   hasApiKey: boolean;
   apiKeyPreview: string;
 }
+
+export interface PaymentTransactionRecord {
+  id: number;
+  orderId: number;
+  orderNumber: string;
+  txKind:
+    | 'food_payment'
+    | 'delivery_cash'
+    | 'food_refund'
+    | 'delivery_reversal'
+    | 'rider_commission_settlement'
+    | string;
+  idempotencyKey: string;
+  payerRole: string;
+  recipientRole: string;
+  paymentMethod: string;
+  amount: number;
+  status: 'pending' | 'succeeded' | 'failed' | 'refunded' | 'cancelled' | string;
+  gatewayTxId: string | null;
+  riderUid: string | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface RiderWalletLedgerEntry {
+  id: number;
+  riderUid: string;
+  orderId: number | null;
+  orderNumber: string;
+  entryType:
+    | 'delivery_earning'
+    | 'commission_owed'
+    | 'commission_settled'
+    | 'commission_reversal'
+    | string;
+  idempotencyKey: string;
+  cashCollected: number;
+  riderEarningDelta: number;
+  commissionOwedDelta: number;
+  commissionSettledDelta: number;
+  referenceId: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface RiderWalletSummary {
+  totalCashCollected: number;
+  totalRiderEarnings: number;
+  totalCommissionOwed: number;
+  totalCommissionSettled: number;
+  outstandingCommission: number;
+  deliveredCountFromLedger: number;
+}
+
+export type DhakaZoneCoverageItem = import('../lib/marketplace-logic').DhakaZoneRiderCoverageItem;
+
 
 
 

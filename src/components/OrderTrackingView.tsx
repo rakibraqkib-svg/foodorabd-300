@@ -24,6 +24,10 @@ import {
   calculateLiveRiderEta,
   computeOrderEtaSummary,
   formatBdt,
+  formatDurationEstimate,
+  getDeliveryVehicleMeta,
+  normalizeDeliveryVehicleMode,
+  type LiveRouteTrafficSummary,
 } from '../lib/marketplace-logic';
 import { playOrderAlertChime, useRealtimeEvents } from '../lib/realtime';
 import { DhakaMapPicker } from './DhakaMapPicker';
@@ -31,6 +35,7 @@ import type {
   Lang,
   OrderEmailLog,
   OrderRecord,
+  PaymentTransactionRecord,
   Restaurant,
   RiderLiveLocation,
 } from '../types/marketplace';
@@ -65,6 +70,7 @@ export function OrderTrackingView({
   const [riderLocation, setRiderLocation] = useState<RiderLiveLocation | null>(null);
   const [nearestRider, setNearestRider] = useState<RiderLiveLocation | null>(null);
   const [emailLogs, setEmailLogs] = useState<OrderEmailLog[]>([]);
+  const [transactions, setTransactions] = useState<PaymentTransactionRecord[]>([]);
   const [history, setHistory] = useState<
     Array<{ id: number; status: string; note: string; createdAt: string }>
   >([]);
@@ -86,6 +92,7 @@ export function OrderTrackingView({
     distanceKm: number;
     drivingMinutes: number;
   } | null>(null);
+  const [liveRouteSummary, setLiveRouteSummary] = useState<LiveRouteTrafficSummary | null>(null);
   const [liveStatusNotice, setLiveStatusNotice] = useState<string | null>(null);
   const prevStatusRef = useRef<string | null>(null);
 
@@ -98,6 +105,7 @@ export function OrderTrackingView({
         riderLocation?: RiderLiveLocation | null;
         nearestRider?: RiderLiveLocation | null;
         emailLogs?: OrderEmailLog[];
+        transactions?: PaymentTransactionRecord[];
         history: Array<{ id: number; status: string; note: string; createdAt: string }>;
       }>(`/api/orders/${orderId}${qs}`);
       if (prevStatusRef.current && prevStatusRef.current !== res.order.status) {
@@ -116,6 +124,7 @@ export function OrderTrackingView({
       setRiderLocation(res.riderLocation ?? null);
       setNearestRider(res.nearestRider ?? null);
       setEmailLogs(res.emailLogs ?? []);
+      setTransactions(res.transactions ?? []);
       setHistory(res.history);
       if (res.order.customerEmail && !trackEmailInput) {
         setTrackEmailInput(res.order.customerEmail);
@@ -168,12 +177,15 @@ export function OrderTrackingView({
 
   useEffect(() => {
     if (!order || !restaurant) return;
+    const mode = normalizeDeliveryVehicleMode(
+      riderLocation?.vehicleType || nearestRider?.vehicleType || 'Motorbike'
+    );
     apiFetch<{ route: { distanceKm: number; drivingMinutes: number } }>(
-      `/api/free/route?fromLat=${restaurant.lat}&fromLng=${restaurant.lng}&toLat=${order.deliveryLat}&toLng=${order.deliveryLng}`
+      `/api/free/route?fromLat=${restaurant.lat}&fromLng=${restaurant.lng}&toLat=${order.deliveryLat}&toLng=${order.deliveryLng}&mode=${encodeURIComponent(mode)}`
     )
       .then((res) => setRouteEstimate(res.route))
       .catch(() => {});
-  }, [order, restaurant]);
+  }, [order, restaurant, riderLocation?.vehicleType, nearestRider?.vehicleType]);
 
   const handleVerifyPayment = async () => {
     if (!order) return;
@@ -261,6 +273,25 @@ export function OrderTrackingView({
     standbyRiderLat: nearestRider?.lat ?? null,
     standbyRiderLng: nearestRider?.lng ?? null,
   });
+  const activeRiderVehicleType =
+    riderLocation?.vehicleType || nearestRider?.vehicleType || 'Motorbike';
+  const activeVehicleMeta = getDeliveryVehicleMeta(
+    liveRouteSummary?.vehicleMode || normalizeDeliveryVehicleMode(activeRiderVehicleType)
+  );
+  const unifiedDistanceKm =
+    order.status === 'delivered'
+      ? 0
+      : liveRouteSummary?.distanceKm ??
+        (riderLocation
+          ? etaSummary.remainingKm
+          : routeEstimate?.distanceKm ?? etaSummary.remainingKm);
+  const unifiedEtaMinutes =
+    order.status === 'delivered'
+      ? 0
+      : liveRouteSummary?.etaMinutes ??
+        (routeEstimate && !riderLocation
+          ? routeEstimate.drivingMinutes
+          : etaSummary.etaMinutes);
   const shareUrl =
     typeof window !== 'undefined'
       ? buildOrderTrackingUrl(
@@ -345,14 +376,99 @@ export function OrderTrackingView({
           </div>
         </div>
 
+        {/* Split Payment Summary Banner */}
+        {(() => {
+          const isSplit =
+            order.paymentMethod !== 'cod' ||
+            order.paymentSplitMode === 'online_food_cash_delivery';
+          const onlineFood =
+            typeof order.onlineFoodPaidAmount === 'number'
+              ? order.onlineFoodPaidAmount
+              : order.paymentMethod === 'cod'
+              ? 0
+              : Math.max(0, order.totalAmount - order.deliveryFee);
+          const cashDelivery =
+            typeof order.cashDueToRider === 'number'
+              ? order.cashDueToRider
+              : order.paymentMethod === 'cod'
+              ? order.totalAmount
+              : order.deliveryFee;
+          const cashStatus = String(order.cashCollectionStatus || 'pending');
+          if (!isSplit) return null;
+          return (
+            <div
+              data-testid="tracking-split-payment-cards"
+              className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs"
+            >
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-bold text-emerald-900">
+                    {order.paymentStatus === 'paid'
+                      ? lang === 'bn'
+                        ? 'অনলাইন পেমেন্ট সম্পন্ন (খাবার)'
+                        : 'Online Paid (Food)'
+                      : lang === 'bn'
+                      ? 'অনলাইন পেমেন্ট বাকি (খাবার)'
+                      : 'Online Food Payable'}
+                  </p>
+                  <p className="text-[10px] text-emerald-700">
+                    {order.paymentMethod.toUpperCase()} · {order.paymentStatus.toUpperCase()}
+                  </p>
+                </div>
+                <span className="font-bold text-sm text-emerald-900 tabular-nums">
+                  {formatBdt(onlineFood, lang)}
+                </span>
+              </div>
+
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-bold text-amber-900">
+                    {lang === 'bn' ? 'রাইডারকে নগদ দিন' : 'Pay Cash to Rider'}
+                  </p>
+                  <p className="text-[10px] text-amber-800">
+                    {cashStatus === 'collected'
+                      ? lang === 'bn'
+                        ? `রাইডার কর্তৃক সংগৃহীত (${formatBdt(order.cashCollectedAmount ?? cashDelivery, lang)})`
+                        : `Collected ${formatBdt(order.cashCollectedAmount ?? cashDelivery, lang)} by Rider`
+                      : cashStatus === 'reversed'
+                      ? lang === 'bn'
+                        ? 'বাতিল / রিভার্সড'
+                        : 'Reversed'
+                      : lang === 'bn'
+                      ? 'ডেলিভারি চার্জ (হাতে দেবেন)'
+                      : 'Delivery Charge on Delivery'}
+                  </p>
+                </div>
+                <span className="font-bold text-sm text-amber-900 tabular-nums">
+                  {formatBdt(cashDelivery, lang)}
+                </span>
+              </div>
+
+              <div className="rounded-xl border border-pink-200 bg-[#FFF0F6] px-3.5 py-2.5 flex items-center justify-between gap-2">
+                <div>
+                  <p className="font-bold text-[#2E3138]">
+                    {lang === 'bn' ? 'গ্রাহকের মোট খরচ' : 'Customer Total Cost'}
+                  </p>
+                  <p className="text-[10px] text-[#E21B70]">
+                    {lang === 'bn' ? 'খাবার + ডেলিভারি' : 'Food + Delivery'}
+                  </p>
+                </div>
+                <span className="font-bold text-sm text-[#E21B70] tabular-nums">
+                  {formatBdt(onlineFood + cashDelivery, lang)}
+                </span>
+              </div>
+            </div>
+          );
+        })()}
+
         {order.paymentMethod !== 'cod' && order.paymentStatus === 'pending' && !isCancelled && (
           <div className="mt-4 p-4 rounded-xl bg-[#FFF0F6] border border-[#E21B70]/20 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 text-sm text-[#2E3138]">
               <CreditCard className="w-4 h-4 text-[#E21B70]" />
               <span>
                 {lang === 'bn'
-                  ? `${order.paymentMethod.toUpperCase()} স্যান্ডবক্স পেমেন্ট সম্পন্ন ও যাচাই করুন (${order.paymentTxId})`
-                  : `Verify ${order.paymentMethod.toUpperCase()} Sandbox Payment (${order.paymentTxId})`}
+                  ? `${order.paymentMethod.toUpperCase()} অনলাইন ফুড পেমেন্ট (${formatBdt(order.onlineFoodPaidAmount ?? Math.max(0, order.totalAmount - order.deliveryFee), lang)}, ডেলিভারি চার্জ ছাড়া) সম্পন্ন ও যাচাই করুন (${order.paymentTxId})`
+                  : `Verify ${order.paymentMethod.toUpperCase()} Online Food Payment (${formatBdt(order.onlineFoodPaidAmount ?? Math.max(0, order.totalAmount - order.deliveryFee), lang)}, excl. delivery charge) · ${order.paymentTxId}`}
               </span>
             </div>
             <button
@@ -368,7 +484,7 @@ export function OrderTrackingView({
                     ? 'যাচাই হচ্ছে...'
                     : 'Verifying...'
                   : lang === 'bn'
-                  ? 'পেমেন্ট যাচাই করুন'
+                  ? 'অনলাইন ফুড পেমেন্ট যাচাই করুন'
                   : 'Complete & Verify Payment'}
               </span>
             </button>
@@ -431,8 +547,8 @@ export function OrderTrackingView({
                       : `Delivered safely to ${order.deliveryArea}`
                     : riderLocation
                     ? lang === 'bn'
-                      ? `${riderLocation.fullName} (${riderLocation.zone}) · আপনার অবস্থান থেকে ${etaSummary.remainingKm.toFixed(1)} কিমি দূরে`
-                      : `${riderLocation.fullName} (${riderLocation.vehicleType}) is in ${riderLocation.zone} · ${etaSummary.remainingKm.toFixed(1)} km away`
+                      ? `${riderLocation.fullName} (${riderLocation.zone}) · আপনার অবস্থান থেকে ${unifiedDistanceKm.toFixed(1)} কিমি দূরে`
+                      : `${riderLocation.fullName} (${riderLocation.vehicleType}) is in ${riderLocation.zone} · ${unifiedDistanceKm.toFixed(1)} km away`
                     : nearestRider
                     ? lang === 'bn'
                       ? `নিকটতম রাইডার (${nearestRider.zone}) কিচেন থেকে ${typeof nearestRider.distanceToRestaurantKm === 'number' ? nearestRider.distanceToRestaurantKm.toFixed(1) : '1.0'} কিমি দূরে প্রস্তুত`
@@ -444,10 +560,10 @@ export function OrderTrackingView({
 
                 <p className="text-[11px] text-neutral-500 font-mono-nums">
                   {riderLocation
-                    ? `${lang === 'bn' ? 'রাইডার GPS:' : 'Rider GPS:'} ${riderLocation.lat.toFixed(4)}, ${riderLocation.lng.toFixed(4)} · ${lang === 'bn' ? 'মোট দূরত্ব' : 'Route'}: ${etaSummary.remainingKm.toFixed(1)} km`
+                    ? `${lang === 'bn' ? 'রাইডার GPS:' : 'Rider GPS:'} ${riderLocation.lat.toFixed(4)}, ${riderLocation.lng.toFixed(4)} · ${lang === 'bn' ? 'মোট দূরত্ব' : 'Route'}: ${unifiedDistanceKm.toFixed(1)} km`
                     : nearestRider
-                    ? `${lang === 'bn' ? 'স্ট্যান্ডবাই GPS:' : 'Standby Rider GPS:'} ${nearestRider.lat.toFixed(4)}, ${nearestRider.lng.toFixed(4)} · ${lang === 'bn' ? 'ডেলিভারি দূরত্ব' : 'Total route'}: ${etaSummary.remainingKm.toFixed(1)} km`
-                    : `${lang === 'bn' ? 'রুট দূরত্ব:' : 'Route distance:'} ${etaSummary.remainingKm.toFixed(1)} km`}
+                    ? `${lang === 'bn' ? 'স্ট্যান্ডবাই GPS:' : 'Standby Rider GPS:'} ${nearestRider.lat.toFixed(4)}, ${nearestRider.lng.toFixed(4)} · ${lang === 'bn' ? 'ডেলিভারি দূরত্ব' : 'Total route'}: ${unifiedDistanceKm.toFixed(1)} km`
+                    : `${lang === 'bn' ? 'রুট দূরত্ব:' : 'Route distance:'} ${unifiedDistanceKm.toFixed(1)} km`}
                 </p>
               </div>
             </div>
@@ -461,7 +577,17 @@ export function OrderTrackingView({
                   {lang === 'bn' ? 'আনুমানিক সময়' : 'Estimated Arrival'}
                 </p>
                 <p className="text-xl font-extrabold text-[#E21B70]">
-                  ~{etaSummary.etaMinutes} {lang === 'bn' ? 'মিনিট' : 'mins'}
+                  ~{formatDurationEstimate(unifiedEtaMinutes, lang)}
+                </p>
+                <p className="text-[10px] font-semibold text-neutral-500">
+                  {lang === 'bn' ? activeVehicleMeta.labelBn : activeVehicleMeta.labelEn}
+                  {liveRouteSummary
+                    ? ` · ${
+                        lang === 'bn'
+                          ? liveRouteSummary.trafficLabelBn
+                          : liveRouteSummary.trafficLabelEn
+                      }`
+                    : ''}
                 </p>
               </div>
             )}
@@ -519,9 +645,20 @@ export function OrderTrackingView({
                 </span>
               )}
             </h2>
-            {routeEstimate && (
-              <span className="text-xs font-medium text-neutral-500 tabular-nums">
-                {routeEstimate.distanceKm.toFixed(1)} km road route · ~{routeEstimate.drivingMinutes} min drive
+            {!isCancelled && (
+              <span
+                data-testid="tracking-map-distance-eta"
+                className="text-xs font-semibold text-[#E21B70] tabular-nums"
+              >
+                {unifiedDistanceKm.toFixed(1)}{' '}
+                {lang === 'bn' ? 'কিমি' : 'km'} ·{' '}
+                {order.status === 'delivered'
+                  ? lang === 'bn'
+                    ? 'ডেলিভারি সম্পন্ন'
+                    : 'Delivered'
+                  : lang === 'bn'
+                  ? `~${formatDurationEstimate(unifiedEtaMinutes, 'bn')} লাগবে`
+                  : `~${formatDurationEstimate(unifiedEtaMinutes, 'en')} away`}
               </span>
             )}
           </div>
@@ -543,13 +680,13 @@ export function OrderTrackingView({
                 ? {
                     lat: riderLocation.lat,
                     lng: riderLocation.lng,
-                    label: `${riderLocation.fullName} (Live)`,
+                    label: `${riderLocation.fullName.replace(/\s+\d{7,}$/, '')} (Live)`,
                   }
                 : nearestRider
                 ? {
                     lat: nearestRider.lat,
                     lng: nearestRider.lng,
-                    label: `${nearestRider.fullName} (${lang === 'bn' ? 'স্ট্যান্ডবাই' : 'Standby Rider'})`,
+                    label: `${nearestRider.fullName.replace(/\s+\d{7,}$/, '')} (${lang === 'bn' ? 'স্ট্যান্ডবাই' : 'Standby'})`,
                   }
                 : undefined
             }
@@ -558,6 +695,13 @@ export function OrderTrackingView({
                 ? { lat: restaurant.lat, lng: restaurant.lng }
                 : { lat: order.deliveryLat, lng: order.deliveryLng }
             }
+            riderVehicleType={activeRiderVehicleType}
+            liveDistanceKm={unifiedDistanceKm}
+            liveEtaMinutes={unifiedEtaMinutes}
+            trackingStatus={order.status}
+            showTraffic
+            showDirectionsSummary
+            onRouteSummary={setLiveRouteSummary}
             heightClass="h-[280px]"
           />
 
@@ -610,7 +754,7 @@ export function OrderTrackingView({
                     {!isTerminal && (
                       <div className="text-right tabular-nums">
                         <p className="text-xs font-bold text-emerald-800">
-                          {liveEta.remainingKm.toFixed(2)} km{' '}
+                          {(liveRouteSummary?.distanceKm ?? liveEta.remainingKm).toFixed(1)} km{' '}
                           {goingToRestaurant
                             ? lang === 'bn'
                               ? 'রেস্টুরেন্টের পথে'
@@ -621,8 +765,8 @@ export function OrderTrackingView({
                         </p>
                         <p className="text-[11px] text-neutral-600">
                           {lang === 'bn'
-                            ? `প্রায় ${liveEta.etaMinutes} মিনিট বাকি`
-                            : `~${liveEta.etaMinutes} min live ETA`}
+                            ? `প্রায় ${formatDurationEstimate(unifiedEtaMinutes, 'bn')} বাকি`
+                            : `~${formatDurationEstimate(unifiedEtaMinutes, 'en', 'compact')} live ETA`}
                         </p>
                       </div>
                     )}
@@ -644,8 +788,8 @@ export function OrderTrackingView({
               <Truck className="w-4 h-4 text-[#E21B70] shrink-0" />
               <span>
                 {lang === 'bn'
-                  ? `Pathao Courier দ্বারা ডেলিভারি চলছে (${order.consignmentId || order.orderNumber}) · আনুমানিক ${etaSummary.etaMinutes} মিনিট।`
-                  : `Tracked via ${order.deliveryProvider} (${order.consignmentId || order.orderNumber}) · ~${etaSummary.etaMinutes} min ETA.`}
+                  ? `Pathao Courier দ্বারা ডেলিভারি চলছে (${order.consignmentId || order.orderNumber}) · আনুমানিক ${formatDurationEstimate(unifiedEtaMinutes, 'bn')}।`
+                  : `Tracked via ${order.deliveryProvider} (${order.consignmentId || order.orderNumber}) · ~${formatDurationEstimate(unifiedEtaMinutes, 'en', 'compact')} ETA.`}
               </span>
             </div>
           ) : nearestRider && !isTerminal ? (
@@ -670,7 +814,7 @@ export function OrderTrackingView({
               </div>
               <div className="text-right tabular-nums">
                 <p className="text-xs font-bold text-[#E21B70]">
-                  ~{etaSummary.etaMinutes} {lang === 'bn' ? 'মিনিট' : 'mins ETA'}
+                  ~{formatDurationEstimate(unifiedEtaMinutes, lang)}{lang === 'bn' ? '' : ' ETA'}
                 </p>
                 <p className="text-[11px] text-neutral-500">
                   {lang === 'bn' ? 'রাইডার অ্যাসাইনমেন্ট প্রক্রিয়াধীন' : 'Auto-dispatching rider'}
@@ -767,12 +911,73 @@ export function OrderTrackingView({
                   </div>
                 )}
                 <div className="flex justify-between font-bold text-sm text-[#2E3138] pt-2 border-t border-neutral-100">
-                  <span>{lang === 'bn' ? 'সর্বমোট' : 'Total Paid / Payable'}</span>
+                  <span>{lang === 'bn' ? 'সর্বমোট খরচ' : 'Customer Total Cost'}</span>
                   <span className="text-[#E21B70]">{formatBdt(order.totalAmount, lang)}</span>
                 </div>
+                {order.paymentMethod !== 'cod' && (
+                  <div className="pt-2 mt-2 border-t border-dashed border-neutral-200 space-y-1">
+                    <div className="flex justify-between text-emerald-800 font-semibold">
+                      <span>{lang === 'bn' ? 'অনলাইনে খাবার পেমেন্ট' : 'Online Food Payment'}</span>
+                      <span>
+                        {formatBdt(
+                          order.onlineFoodPaidAmount ?? Math.max(0, order.totalAmount - order.deliveryFee),
+                          lang
+                        )}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-amber-800 font-semibold">
+                      <span>{lang === 'bn' ? 'রাইডারকে নগদ (ডেলিভারি)' : 'Cash to Rider (Delivery)'}</span>
+                      <span>{formatBdt(order.cashDueToRider ?? order.deliveryFee, lang)}</span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
+
+          {/* Separate Payment & Delivery Transaction Records */}
+          {transactions.length > 0 && (
+            <div
+              data-testid="order-transactions-card"
+              className="bg-white rounded-2xl border border-neutral-200 p-5 space-y-2.5"
+            >
+              <h2 className="text-sm font-bold text-[#2E3138]">
+                {lang === 'bn' ? 'পেমেন্ট ও ডেলিভারি লেনদেন রেকর্ড' : 'Split Transaction Records'}
+              </h2>
+              <div className="space-y-2">
+                {transactions.map((tx) => (
+                  <div
+                    key={tx.id}
+                    className="p-2.5 rounded-xl border border-neutral-200 bg-neutral-50 flex items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-semibold text-[#2E3138] capitalize">
+                        {tx.txKind.replace(/_/g, ' ')}
+                      </p>
+                      <p className="text-[11px] text-neutral-500 truncate">
+                        {tx.paymentMethod.toUpperCase()} · {tx.payerRole} → {tx.recipientRole}
+                        {tx.gatewayTxId ? ` · ${tx.gatewayTxId}` : ''}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0 tabular-nums">
+                      <p className="font-bold text-[#2E3138]">{formatBdt(tx.amount, lang)}</p>
+                      <span
+                        className={`inline-block text-[10px] font-bold uppercase px-1.5 py-0.5 rounded ${
+                          tx.status === 'succeeded'
+                            ? 'bg-emerald-50 text-emerald-700'
+                            : tx.status === 'refunded' || tx.status === 'cancelled'
+                            ? 'bg-red-50 text-red-700'
+                            : 'bg-amber-50 text-amber-800'
+                        }`}
+                      >
+                        {tx.status}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Email Order Tracking & Notification Log Card */}
           <div

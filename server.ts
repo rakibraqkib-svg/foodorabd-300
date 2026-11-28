@@ -23,6 +23,7 @@ import {
   orderStatusHistory,
   partnerApiKeys,
   paymentGateways,
+  paymentTransactions,
   platformSettings,
   restaurantPayouts,
   restaurants,
@@ -30,6 +31,7 @@ import {
   riderJobApplications,
   riderJobs,
   riders,
+  riderWalletLedger,
   users,
   vendorAdminMessages,
 } from './src/db/schema.ts';
@@ -74,25 +76,37 @@ import {
   buildSitemapXml,
   calculateCartItemUnitPrice,
   calculateOrderFinancials,
+  calculateSplitOrderFinancials,
+  calculateZoneDistanceDeliveryFee,
   canActorModifyUserAccount,
   canOwnerOpenNewRestaurant,
+  canRiderAcceptOrders,
   canTransitionOrderStatus,
+  canVendorProcessPrepaidOrder,
   DeliveryMode,
   doesEmailMatchOrder,
   estimateDeliveryFeeAndEta,
   parseUploadedImageDataUrl,
   evaluateCoupon,
+  extractAiReplyText,
+  coerceSafeErrorText,
+  filterGeminiCandidateModels,
   generateFoodoraOwnAiReply,
   haversineDistanceKm,
   isBicycleVehicleType,
   isProtectedSuperAdminEmail,
   isValidExternalAiBaseUrl,
+  mergeDeliveryFinancialConfig,
   normalizeAiProviderCode,
   normalizeGatewayCode,
   normalizePartnerProductInput,
   OrderStatus,
   PaymentMethod,
   pickNearestStandbyRider,
+  resolveRiderCashCollectAmount,
+  selectAutoBangladeshiDeliveryService,
+  summarizeDhakaZoneRiderCoverage,
+  summarizeRiderWalletLedger,
   toAdminAiProviderView,
   toAdminPaymentGatewayView,
   toPublicAiProviderView,
@@ -213,6 +227,240 @@ async function settleOrderCommissionIdempotent(orderId: number) {
   });
 }
 
+async function recordRiderDeliveryWalletIdempotent(
+  orderId: number,
+  collectedCashInput?: number | null,
+  actorUid: string = 'system'
+) {
+  await db.transaction(async (tx) => {
+    const orderRows = await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1);
+    if (orderRows.length === 0) return;
+    const order = orderRows[0];
+
+    const expectedCash =
+      order.paymentSplitMode === 'online_food_cash_delivery'
+        ? Math.max(0, order.cashDueToRider || order.deliveryFee || 0)
+        : order.paymentMethod === 'cod'
+        ? Math.max(0, order.totalAmount)
+        : 0;
+
+    const finalCollectedCash =
+      typeof collectedCashInput === 'number' && Number.isFinite(collectedCashInput)
+        ? Math.max(0, Math.round(collectedCashInput))
+        : expectedCash;
+
+    // Update order cash collection status once
+    if (order.cashCollectionStatus !== 'collected') {
+      await tx
+        .update(orders)
+        .set({
+          cashCollectionStatus: 'collected',
+          cashCollectedAmount: finalCollectedCash,
+          cashCollectedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(orders.id, order.id));
+    }
+
+    // Mark delivery_cash transaction succeeded or create idempotently
+    const delCashKey = `delivery_cash:${order.orderNumber}`;
+    const existingDelTx = await tx
+      .select()
+      .from(paymentTransactions)
+      .where(eq(paymentTransactions.idempotencyKey, delCashKey))
+      .limit(1);
+
+    if (existingDelTx.length > 0) {
+      await tx
+        .update(paymentTransactions)
+        .set({
+          amount: finalCollectedCash,
+          status: 'succeeded',
+          riderUid: order.riderUid || existingDelTx[0].riderUid || '',
+          note: `Cash delivery charge collected by rider (${actorUid})`,
+          updatedAt: new Date(),
+        })
+        .where(eq(paymentTransactions.idempotencyKey, delCashKey));
+    } else {
+      await tx
+        .insert(paymentTransactions)
+        .values({
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          txKind: 'delivery_cash',
+          idempotencyKey: delCashKey,
+          payerRole: 'customer',
+          recipientRole: 'rider',
+          paymentMethod: 'cash',
+          amount: finalCollectedCash,
+          status: 'succeeded',
+          riderUid: order.riderUid || '',
+          note: `Cash delivery charge collected by rider (${actorUid})`,
+        })
+        .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    }
+
+    if (!order.riderUid) return;
+
+    const earnKey = `delivery_earn:${order.orderNumber}`;
+    const existingEarn = await tx
+      .select()
+      .from(riderWalletLedger)
+      .where(eq(riderWalletLedger.idempotencyKey, earnKey))
+      .limit(1);
+
+    if (existingEarn.length > 0) {
+      return; // Idempotency guard: never double-credit rider earnings/deliveries
+    }
+
+    const riderShare =
+      order.riderEarningAmount > 0
+        ? order.riderEarningAmount
+        : Math.max(0, Math.round((order.cashDueToRider || order.deliveryFee || 0) * 0.75));
+    const foodoraCommission =
+      order.foodoraDeliveryCommission > 0 || (order.cashDueToRider || order.deliveryFee) > 0
+        ? Math.max(0, (order.cashDueToRider || order.deliveryFee || 0) - riderShare)
+        : 0;
+
+    await tx
+      .insert(riderWalletLedger)
+      .values({
+        riderUid: order.riderUid,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        entryType: 'delivery_earning',
+        idempotencyKey: earnKey,
+        cashCollected: finalCollectedCash,
+        riderEarningDelta: riderShare,
+        commissionOwedDelta: 0,
+        commissionSettledDelta: 0,
+        referenceId: `DEL-${order.orderNumber}`,
+        note: `Cash collected ৳${finalCollectedCash} · Rider earned ৳${riderShare}`,
+      })
+      .onConflictDoNothing({ target: riderWalletLedger.idempotencyKey });
+
+    if (foodoraCommission > 0) {
+      await tx
+        .insert(riderWalletLedger)
+        .values({
+          riderUid: order.riderUid,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          entryType: 'commission_owed',
+          idempotencyKey: `commission_owed:${order.orderNumber}`,
+          cashCollected: 0,
+          riderEarningDelta: 0,
+          commissionOwedDelta: foodoraCommission,
+          commissionSettledDelta: 0,
+          referenceId: `COM-${order.orderNumber}`,
+          note: `Foodora delivery commission owed on ${order.orderNumber}`,
+        })
+        .onConflictDoNothing({ target: riderWalletLedger.idempotencyKey });
+    }
+
+    await tx
+      .update(riders)
+      .set({
+        totalDeliveries: sql`${riders.totalDeliveries} + 1`,
+        totalEarnings: sql`${riders.totalEarnings} + ${riderShare}`,
+      })
+      .where(eq(riders.uid, order.riderUid));
+  });
+}
+
+async function reverseOrderSplitFinancialsTx(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  order: typeof orders.$inferSelect,
+  reason: string
+) {
+  const foodPaidAmt =
+    order.paymentSplitMode === 'online_food_cash_delivery'
+      ? Math.max(0, order.onlineFoodPaidAmount || 0)
+      : Math.max(0, order.totalAmount);
+
+  if (order.paymentStatus === 'paid' && foodPaidAmt > 0) {
+    await tx
+      .insert(paymentTransactions)
+      .values({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        txKind: 'food_refund',
+        idempotencyKey: `food_refund:${order.orderNumber}`,
+        payerRole: 'platform',
+        recipientRole: 'customer',
+        paymentMethod: order.paymentMethod,
+        amount: foodPaidAmt,
+        status: 'refunded',
+        gatewayTxId: order.paymentTxId || '',
+        note: reason,
+      })
+      .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+  }
+
+  const delCashKey = `delivery_cash:${order.orderNumber}`;
+  if (order.cashCollectionStatus === 'collected') {
+    await tx
+      .insert(paymentTransactions)
+      .values({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        txKind: 'delivery_reversal',
+        idempotencyKey: `delivery_reversal:${order.orderNumber}`,
+        payerRole: 'rider',
+        recipientRole: 'customer',
+        paymentMethod: 'cash',
+        amount: order.cashCollectedAmount || order.cashDueToRider || order.deliveryFee || 0,
+        status: 'refunded',
+        riderUid: order.riderUid || '',
+        note: reason,
+      })
+      .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+
+    await tx
+      .update(orders)
+      .set({ cashCollectionStatus: 'reversed', updatedAt: new Date() })
+      .where(eq(orders.id, order.id));
+  } else {
+    await tx
+      .update(paymentTransactions)
+      .set({ status: 'cancelled', note: reason, updatedAt: new Date() })
+      .where(eq(paymentTransactions.idempotencyKey, delCashKey));
+  }
+
+  if (order.riderUid) {
+    const existingEarn = await tx
+      .select()
+      .from(riderWalletLedger)
+      .where(eq(riderWalletLedger.idempotencyKey, `delivery_earn:${order.orderNumber}`))
+      .limit(1);
+    if (existingEarn.length > 0) {
+      const earnRow = existingEarn[0];
+      const existingOwed = await tx
+        .select()
+        .from(riderWalletLedger)
+        .where(eq(riderWalletLedger.idempotencyKey, `commission_owed:${order.orderNumber}`))
+        .limit(1);
+      const owedAmt = existingOwed[0]?.commissionOwedDelta || 0;
+      await tx
+        .insert(riderWalletLedger)
+        .values({
+          riderUid: order.riderUid,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          entryType: 'commission_reversal',
+          idempotencyKey: `delivery_rev:${order.orderNumber}`,
+          cashCollected: -(earnRow.cashCollected || 0),
+          riderEarningDelta: -(earnRow.riderEarningDelta || 0),
+          commissionOwedDelta: -owedAmt,
+          commissionSettledDelta: 0,
+          referenceId: `REV-${order.orderNumber}`,
+          note: reason,
+        })
+        .onConflictDoNothing({ target: riderWalletLedger.idempotencyKey });
+    }
+  }
+}
+
 function getRequestOrigin(req: express.Request): string {
   const protoHeader = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
     .split(',')[0]
@@ -237,7 +485,32 @@ app.get('/sitemap.xml', async (req, res) => {
     const approved = hasDatabaseConfig() ? await getApprovedRestaurants() : [];
     const xml = buildSitemapXml(
       getRequestOrigin(req),
-      approved.map((r) => ({ slug: r.slug, updatedAt: r.updatedAt }))
+      approved.map((r) => ({ slug: r.slug, updatedAt: r.updatedAt })),
+      {
+        areas: [
+          'Gulshan 2',
+          'Banani',
+          'Dhanmondi',
+          'Uttara',
+          'Mirpur',
+          'Bashundhara R/A',
+          'Motijheel',
+          'Chattogram',
+          'Sylhet',
+          'Rajshahi',
+          'Khulna',
+        ],
+        cuisines: [
+          'Biriyani',
+          'Burger',
+          'Pizza',
+          'Bangladeshi',
+          'Kabab',
+          'Chinese & Momos',
+          'Bakery & Cakes',
+          'Coffee & Drinks',
+        ],
+      }
     );
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     res.setHeader('Cache-Control', 'public, max-age=900');
@@ -287,7 +560,7 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/public-config', async (_req, res) => {
   try {
-    const [settings, gatewayRows, activeOrderRows] = await Promise.all([
+    const [settings, gatewayRows, activeOrderRows, allRiders] = await Promise.all([
       getPlatformSettingsRow(),
       ensureDefaultPaymentGateways(),
       db
@@ -303,6 +576,14 @@ app.get('/api/public-config', async (_req, res) => {
         .orderBy(desc(orders.createdAt))
         .limit(30)
         .catch(() => []),
+      db
+        .select({
+          zone: riders.zone,
+          status: riders.status,
+          isAvailable: riders.isAvailable,
+        })
+        .from(riders)
+        .catch(() => []),
     ]);
     const paymentGatewaysList = gatewayRows.map((row) =>
       toPublicPaymentGatewayView(row, isEnvConfiguredForGateway(row.code))
@@ -312,7 +593,13 @@ app.get('/api/public-config', async (_req, res) => {
     if (!sc.googleSiteVerification && process.env.GOOGLE_SITE_VERIFICATION) {
       sc.googleSiteVerification = process.env.GOOGLE_SITE_VERIFICATION.trim();
     }
-    const settingsWithVerification = settings ? { ...settings, storefrontConfig: sc } : settings;
+    const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+      (settings?.deliveryFinancialConfig as Record<string, unknown> | undefined) || null
+    );
+    const dhakaZoneCoverage = summarizeDhakaZoneRiderCoverage(allRiders, deliveryFinancialConfig);
+    const settingsWithVerification = settings
+      ? { ...settings, storefrontConfig: sc, deliveryFinancialConfig }
+      : settings;
     const pinnedId = Number(sc.featuredActiveOrderId);
     const activeRow =
       sc.showActiveDeliveryBar === false
@@ -326,6 +613,8 @@ app.get('/api/public-config', async (_req, res) => {
       paymentGateways: paymentGatewaysList,
       emailTransport,
       settings: settingsWithVerification,
+      deliveryFinancialConfig,
+      dhakaZoneCoverage,
       featuredActiveOrder: activeRow
         ? {
             orderId: activeRow.id,
@@ -722,11 +1011,19 @@ app.post('/api/auth/register', async (req, res) => {
             phone: '+8801700000000',
             email: emailLower,
             vehicleType: 'Motorbike',
-            zone: 'Gulshan 2',
-            isAvailable: true,
-            status: 'approved',
+            zone: 'ZONE 01 — GULSHAN',
+            isAvailable: false,
+            status: 'pending',
           })
           .onConflictDoNothing();
+
+        await tx.insert(notifications).values({
+          recipientUid: 'role-super_admin',
+          roleTarget: 'super_admin',
+          title: 'New Dhaka Zone Rider Pending Approval',
+          message: `${fullName} registered as a rider and awaits zone approval.`,
+          type: 'system',
+        });
       }
     });
 
@@ -1252,7 +1549,12 @@ app.get('/api/free/route', async (req, res) => {
   if (![fromLat, fromLng, toLat, toLng].every(Number.isFinite)) {
     return res.status(400).json({ error: 'Invalid coordinates' });
   }
-  const route = await fetchOsrmRoute(fromLat, fromLng, toLat, toLng);
+  const includeSteps = req.query.steps === '1' || req.query.steps === 'true';
+  const vehicleMode = typeof req.query.mode === 'string' ? req.query.mode : undefined;
+  const route = await fetchOsrmRoute(fromLat, fromLng, toLat, toLng, {
+    includeSteps,
+    vehicleMode,
+  });
   res.json({ route });
 });
 
@@ -1272,7 +1574,9 @@ app.post('/api/delivery/quote', async (req, res) => {
     restaurantId: z.number().int().positive(),
     dropoffLat: z.number(),
     dropoffLng: z.number(),
-    deliveryMode: z.enum(['platform', 'restaurant', 'third_party']),
+    dropoffArea: z.string().trim().max(120).optional(),
+    deliveryMode: z.enum(['platform', 'restaurant', 'third_party']).optional(),
+    deliveryServiceCode: z.string().trim().max(32).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1280,14 +1584,26 @@ app.post('/api/delivery/quote', async (req, res) => {
   }
 
   try {
-    const rows = await db
-      .select()
-      .from(restaurants)
-      .where(eq(restaurants.id, parsed.data.restaurantId))
-      .limit(1);
-    if (rows.length === 0) return res.status(404).json({ error: 'Restaurant not found' });
-    const rest = rows[0];
-    const provider = getDeliveryProvider(parsed.data.deliveryMode);
+    const [restRows, settingsRows] = await Promise.all([
+      db
+        .select()
+        .from(restaurants)
+        .where(eq(restaurants.id, parsed.data.restaurantId))
+        .limit(1),
+      db.select().from(platformSettings).limit(1).catch(() => []),
+    ]);
+    if (restRows.length === 0) return res.status(404).json({ error: 'Restaurant not found' });
+    const rest = restRows[0];
+    const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+      (settingsRows[0]?.deliveryFinancialConfig as Record<string, unknown> | undefined) || null
+    );
+    const selectedService = selectAutoBangladeshiDeliveryService({
+      restaurantDeliveryMode: rest.deliveryMode as DeliveryMode,
+      preferredServiceCode: parsed.data.deliveryServiceCode,
+      deliveryModeOverride: parsed.data.deliveryMode,
+      pathaoEnabled: settingsRows[0]?.pathaoEnabled ?? true,
+    });
+    const provider = getDeliveryProvider(selectedService.mode, selectedService.code);
     const [baseQuote, osrmRoute, weather] = await Promise.all([
       provider.getQuote({
         orderNumber: 'QUOTE',
@@ -1296,7 +1612,7 @@ app.post('/api/delivery/quote', async (req, res) => {
         pickupLat: rest.lat,
         pickupLng: rest.lng,
         dropoffAddress: 'Customer Pin',
-        dropoffArea: rest.area,
+        dropoffArea: parsed.data.dropoffArea || rest.area,
         dropoffLat: parsed.data.dropoffLat,
         dropoffLng: parsed.data.dropoffLng,
         customerName: 'Guest',
@@ -1309,19 +1625,36 @@ app.post('/api/delivery/quote', async (req, res) => {
     ]);
 
     const baseFeeInput =
-      parsed.data.deliveryMode === 'third_party' ? Math.max(55, rest.deliveryFee) : rest.deliveryFee;
+      selectedService.mode === 'third_party'
+        ? Math.max(selectedService.minBaseFee, rest.deliveryFee)
+        : rest.deliveryFee;
     const roadCalc = estimateDeliveryFeeAndEta(
       osrmRoute.distanceKm,
       baseFeeInput,
-      parsed.data.deliveryMode
+      selectedService.mode
     );
+    const zoneDistanceCalc = calculateZoneDistanceDeliveryFee({
+      area: parsed.data.dropoffArea || rest.area,
+      distanceKm: osrmRoute.distanceKm,
+      fallbackFee: roadCalc.fee,
+      config: deliveryFinancialConfig,
+    });
 
     res.json({
       quote: {
         ...baseQuote,
+        serviceCode: selectedService.code,
+        provider: provider.name,
+        mode: selectedService.mode,
         distanceKm: osrmRoute.distanceKm,
-        fee: roadCalc.fee,
-        etaMinutes: Math.max(12, osrmRoute.drivingMinutes + 12 + weather.rainBufferMin),
+        fee: zoneDistanceCalc.deliveryFee,
+        zoneCode: zoneDistanceCalc.zoneCode,
+        zoneName: zoneDistanceCalc.zoneName,
+        pricingSource: zoneDistanceCalc.pricingSource,
+        etaMinutes: Math.max(
+          12,
+          osrmRoute.drivingMinutes + 12 + weather.rainBufferMin + selectedService.etaOffsetMin
+        ),
         routeSource: osrmRoute.source,
         rainBufferMin: weather.rainBufferMin,
         weatherLabel: weather.labelEn,
@@ -1584,6 +1917,9 @@ app.post('/api/orders/:id/send-tracking-email', optionalAuth, async (req: AuthRe
         riderPhone: riderRows[0]?.phone || null,
         etaMinutes: order.estimatedMinutes,
         createdAt: order.createdAt,
+        paymentSplitMode: order.paymentSplitMode,
+        onlineFoodPaidAmount: order.onlineFoodPaidAmount,
+        cashDueToRider: order.cashDueToRider,
         items: order.itemsSnapshotJson,
       }),
       getEmailTransportStatus(),
@@ -1615,6 +1951,7 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
     deliveryLng: z.number(),
     deliveryInstructions: z.string().optional(),
     deliveryMode: z.enum(['platform', 'restaurant', 'third_party']),
+    deliveryServiceCode: z.string().trim().max(32).optional(),
     paymentMethod: z.string().min(2).max(32),
     couponCode: z.string().optional(),
     items: z
@@ -1745,8 +2082,15 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
         throw new Error(`Minimum order for ${rest.name} is ৳${rest.minOrder}`);
       }
 
-      // 3. Delivery quote via modular DeliveryProvider
-      const provider = getDeliveryProvider(input.deliveryMode as DeliveryMode);
+      // 3. Delivery quote via modular Bangladeshi DeliveryProvider
+      const orderSettings = await tx.select().from(platformSettings).limit(1);
+      const selectedService = selectAutoBangladeshiDeliveryService({
+        restaurantDeliveryMode: rest.deliveryMode as DeliveryMode,
+        preferredServiceCode: input.deliveryServiceCode,
+        deliveryModeOverride: input.deliveryMode,
+        pathaoEnabled: orderSettings[0]?.pathaoEnabled ?? true,
+      });
+      const provider = getDeliveryProvider(selectedService.mode, selectedService.code);
       const quote = await provider.getQuote({
         orderNumber: 'NEW',
         restaurantName: rest.name,
@@ -1763,9 +2107,25 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
         orderValue: subtotal,
       });
 
+      const settings = orderSettings;
+      const serviceFee = settings[0]?.serviceFee ?? 10;
+      const deliveryFinancialConfig = mergeDeliveryFinancialConfig(
+        (settings[0]?.deliveryFinancialConfig as Record<string, unknown> | undefined) || null
+      );
+      const estRoadKm =
+        Math.round(
+          haversineDistanceKm(rest.lat, rest.lng, input.deliveryLat, input.deliveryLng) * 1.25 * 10
+        ) / 10;
+      const zoneFeeCalc = calculateZoneDistanceDeliveryFee({
+        area: input.deliveryArea,
+        distanceKm: estRoadKm,
+        fallbackFee: quote.fee,
+        config: deliveryFinancialConfig,
+      });
+
       // 4. Coupon evaluation
       let discountAmount = 0;
-      let deliveryFeeAfterCoupon = quote.fee;
+      let deliveryFeeAfterCoupon = zoneFeeCalc.deliveryFee;
       let appliedCouponCode = '';
 
       if (input.couponCode && input.couponCode.trim()) {
@@ -1789,7 +2149,7 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
               usageLimit: c.usageLimit,
             },
             subtotal,
-            quote.fee,
+            zoneFeeCalc.deliveryFee,
             rest.id
           );
           if (evalRes.valid) {
@@ -1804,11 +2164,8 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
         }
       }
 
-      const settings = await tx.select().from(platformSettings).limit(1);
-      const serviceFee = settings[0]?.serviceFee ?? 10;
-
-      // 5. Financial calculations
-      const financials = calculateOrderFinancials({
+      // 5. Split Financial calculations (Online Food Payment + Cash Delivery Charge to Rider)
+      const financials = calculateSplitOrderFinancials({
         subtotal,
         discountAmount,
         deliveryFee: deliveryFeeAfterCoupon,
@@ -1816,13 +2173,20 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
         commissionType: (rest.commissionType as 'percentage' | 'fixed') || 'percentage',
         commissionRate: Number(rest.commissionRate) || 15,
         fixedCommission: rest.fixedCommission || 0,
+        paymentMethod: normalizedMethod,
+        riderEarningRule: deliveryFinancialConfig.riderEarningRule,
       });
 
       const orderNumber = `FD-BD-${Math.floor(10000 + Math.random() * 89999)}`;
+      const onlineChargeAmount =
+        financials.paymentSplitMode === 'online_food_cash_delivery'
+          ? financials.onlineFoodPayable
+          : financials.totalPayable;
+
       const paymentInit = initiatePaymentSession(
         normalizedMethod as PaymentMethod,
         orderNumber,
-        financials.totalPayable,
+        onlineChargeAmount,
         matchedGateway
       );
       const deliveryDispatch = await provider.createDelivery({
@@ -1857,7 +2221,7 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
           deliveryLat: input.deliveryLat,
           deliveryLng: input.deliveryLng,
           deliveryInstructions: input.deliveryInstructions || '',
-          deliveryMode: input.deliveryMode,
+          deliveryMode: selectedService.mode,
           deliveryProvider: deliveryDispatch.provider,
           consignmentId: deliveryDispatch.consignmentId,
           paymentMethod: normalizedMethod,
@@ -1869,10 +2233,17 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
           deliveryFee: financials.deliveryFee,
           serviceFee: financials.serviceFee,
           taxAmount: financials.taxAmount,
-          totalAmount: financials.totalPayable,
+          totalAmount: financials.customerTotalCost,
           commissionRate: rest.commissionRate,
           platformCommission: financials.platformCommission,
           restaurantEarnings: financials.restaurantEarnings,
+          paymentSplitMode: financials.paymentSplitMode,
+          onlineFoodPaidAmount: financials.onlineFoodPayable,
+          cashDueToRider: financials.cashDueToRider,
+          riderEarningAmount: financials.riderEarningAmount,
+          foodoraDeliveryCommission: financials.foodoraDeliveryCommission,
+          cashCollectionStatus: financials.cashDueToRider === 0 ? 'collected' : 'pending',
+          cashCollectedAmount: 0,
           status: 'confirmed',
           estimatedMinutes: quote.etaMinutes,
           itemsSnapshotJson: snapshotItems,
@@ -1881,10 +2252,66 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
 
       const newOrder = insertedOrders[0];
 
+      // Record separate idempotent transaction entries for Online Food Payment & Delivery Cash Charge
+      if (financials.paymentSplitMode === 'online_food_cash_delivery') {
+        await tx
+          .insert(paymentTransactions)
+          .values([
+            {
+              orderId: newOrder.id,
+              orderNumber: newOrder.orderNumber,
+              txKind: 'food_payment',
+              idempotencyKey: `food_pay:${newOrder.orderNumber}`,
+              payerRole: 'customer',
+              recipientRole: 'platform_restaurant',
+              paymentMethod: normalizedMethod,
+              amount: financials.onlineFoodPayable,
+              status: 'pending',
+              gatewayTxId: paymentInit.transactionId,
+              note: `Online food payment via ${normalizedMethod.toUpperCase()} (excludes delivery charge)`,
+            },
+            {
+              orderId: newOrder.id,
+              orderNumber: newOrder.orderNumber,
+              txKind: 'delivery_cash',
+              idempotencyKey: `delivery_cash:${newOrder.orderNumber}`,
+              payerRole: 'customer',
+              recipientRole: 'rider',
+              paymentMethod: 'cash',
+              amount: financials.cashDueToRider,
+              status: financials.cashDueToRider === 0 ? 'succeeded' : 'pending',
+              note:
+                financials.cashDueToRider === 0
+                  ? 'Free delivery coupon applied (৳0 cash due to rider)'
+                  : `Pay cash to rider on delivery (Rider ৳${financials.riderEarningAmount} + Foodora commission ৳${financials.foodoraDeliveryCommission})`,
+            },
+          ])
+          .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+      } else {
+        await tx
+          .insert(paymentTransactions)
+          .values({
+            orderId: newOrder.id,
+            orderNumber: newOrder.orderNumber,
+            txKind: 'delivery_cash',
+            idempotencyKey: `delivery_cash:${newOrder.orderNumber}`,
+            payerRole: 'customer',
+            recipientRole: 'rider',
+            paymentMethod: 'cod',
+            amount: financials.cashDueToRider,
+            status: 'pending',
+            note: 'Legacy Cash on Delivery full order collection',
+          })
+          .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+      }
+
       await tx.insert(orderStatusHistory).values({
         orderId: newOrder.id,
         status: 'confirmed',
-        note: `Order placed via ${input.paymentMethod.toUpperCase()} (${deliveryDispatch.provider})`,
+        note:
+          financials.paymentSplitMode === 'online_food_cash_delivery'
+            ? `Order placed via ${input.paymentMethod.toUpperCase()} (Food Online ৳${financials.onlineFoodPayable} · Delivery Cash to Rider ৳${financials.cashDueToRider})`
+            : `Order placed via ${input.paymentMethod.toUpperCase()} (${deliveryDispatch.provider})`,
         actorUid: req.user!.uid,
       });
 
@@ -1893,7 +2320,10 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
           recipientUid: rest.ownerUid,
           roleTarget: 'restaurant_owner',
           title: `New Order ${newOrder.orderNumber}`,
-          message: `৳${newOrder.totalAmount} order from ${input.customerName} (${input.deliveryArea})`,
+          message:
+            financials.paymentSplitMode === 'online_food_cash_delivery'
+              ? `Food ৳${financials.onlineFoodPayable} (${normalizedMethod.toUpperCase()} pending verify) · Delivery Cash ৳${financials.cashDueToRider} · ${input.deliveryArea}`
+              : `৳${newOrder.totalAmount} order from ${input.customerName} (${input.deliveryArea})`,
           type: 'order',
           relatedOrderId: newOrder.id,
         },
@@ -1901,7 +2331,7 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
           recipientUid: 'role-super_admin',
           roleTarget: 'super_admin',
           title: `New Order ${newOrder.orderNumber} · ${rest.name}`,
-          message: `৳${newOrder.totalAmount} order from ${input.customerName} (${input.deliveryArea})`,
+          message: `Food ৳${financials.onlineFoodPayable} + Cash Delivery ৳${financials.cashDueToRider} (${input.deliveryArea})`,
           type: 'order',
           relatedOrderId: newOrder.id,
         },
@@ -1909,7 +2339,10 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
           recipientUid: req.user!.uid,
           roleTarget: 'customer',
           title: `Order ${newOrder.orderNumber} Confirmed`,
-          message: `Your order from ${rest.name} has been received.`,
+          message:
+            financials.paymentSplitMode === 'online_food_cash_delivery'
+              ? `Pay food ৳${financials.onlineFoodPayable} online; pay ৳${financials.cashDueToRider} delivery cash to rider.`
+              : `Your order from ${rest.name} has been received.`,
           type: 'order',
           relatedOrderId: newOrder.id,
         },
@@ -1958,6 +2391,9 @@ app.post('/api/orders', requireAuth, async (req: AuthRequest, res) => {
             statusNote: `Order placed via ${input.paymentMethod.toUpperCase()}`,
             etaMinutes: created.order.estimatedMinutes,
             createdAt: created.order.createdAt,
+            paymentSplitMode: created.order.paymentSplitMode,
+            onlineFoodPaidAmount: created.order.onlineFoodPaidAmount,
+            cashDueToRider: created.order.cashDueToRider,
             items: created.order.itemsSnapshotJson,
           })
         : Promise.resolve(null),
@@ -2055,10 +2491,14 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthRequest, res) => {
     const matchedGateway = gatewayRows.find(
       (g) => normalizeGatewayCode(g.code) === normalizeGatewayCode(order.paymentMethod)
     );
+    const verifyExpectedAmount =
+      order.paymentSplitMode === 'online_food_cash_delivery' && (order.onlineFoodPaidAmount || 0) > 0
+        ? order.onlineFoodPaidAmount
+        : order.totalAmount;
     const verification = verifyPaymentServerSide(
       order.paymentMethod as PaymentMethod,
       parsed.data.transactionId,
-      order.totalAmount,
+      verifyExpectedAmount,
       matchedGateway
     );
 
@@ -2075,6 +2515,41 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthRequest, res) => {
       })
       .where(eq(orders.id, order.id))
       .returning();
+
+    const foodPayKey = `food_pay:${order.orderNumber}`;
+    const existingFoodTx = await db
+      .select()
+      .from(paymentTransactions)
+      .where(eq(paymentTransactions.idempotencyKey, foodPayKey))
+      .limit(1);
+    if (existingFoodTx.length > 0) {
+      await db
+        .update(paymentTransactions)
+        .set({
+          status: 'succeeded',
+          gatewayTxId: verification.transactionId,
+          note: verification.message,
+          updatedAt: new Date(),
+        })
+        .where(eq(paymentTransactions.idempotencyKey, foodPayKey));
+    } else {
+      await db
+        .insert(paymentTransactions)
+        .values({
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          txKind: 'food_payment',
+          idempotencyKey: foodPayKey,
+          payerRole: 'customer',
+          recipientRole: 'platform_restaurant',
+          paymentMethod: order.paymentMethod,
+          amount: verifyExpectedAmount,
+          status: 'succeeded',
+          gatewayTxId: verification.transactionId,
+          note: verification.message,
+        })
+        .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    }
 
     await db.insert(orderStatusHistory).values({
       orderId: order.id,
@@ -2119,6 +2594,9 @@ app.post('/api/payments/verify', requireAuth, async (req: AuthRequest, res) => {
         riderName: updated[0].riderName,
         etaMinutes: updated[0].estimatedMinutes,
         createdAt: updated[0].createdAt,
+        paymentSplitMode: updated[0].paymentSplitMode,
+        onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+        cashDueToRider: updated[0].cashDueToRider,
         items: updated[0].itemsSnapshotJson,
       });
     }
@@ -2196,6 +2674,45 @@ app.post('/api/payments/webhook/:code', async (req, res) => {
       .where(eq(orders.id, targetOrder.id))
       .returning();
 
+    const webhookFoodKey = `food_pay:${targetOrder.orderNumber}`;
+    const existingWebhookTx = await db
+      .select()
+      .from(paymentTransactions)
+      .where(eq(paymentTransactions.idempotencyKey, webhookFoodKey))
+      .limit(1);
+    const webhookTxStatus = nextPaymentStatus === 'paid' ? 'succeeded' : 'failed';
+    if (existingWebhookTx.length > 0) {
+      await db
+        .update(paymentTransactions)
+        .set({
+          status: webhookTxStatus,
+          gatewayTxId: txId || targetOrder.paymentTxId || '',
+          note: `Webhook (${gateway.name}) marked food payment as ${nextPaymentStatus}`,
+          updatedAt: new Date(),
+        })
+        .where(eq(paymentTransactions.idempotencyKey, webhookFoodKey));
+    } else {
+      await db
+        .insert(paymentTransactions)
+        .values({
+          orderId: targetOrder.id,
+          orderNumber: targetOrder.orderNumber,
+          txKind: 'food_payment',
+          idempotencyKey: webhookFoodKey,
+          payerRole: 'customer',
+          recipientRole: 'platform_restaurant',
+          paymentMethod: targetOrder.paymentMethod,
+          amount:
+            targetOrder.paymentSplitMode === 'online_food_cash_delivery'
+              ? targetOrder.onlineFoodPaidAmount || 0
+              : targetOrder.totalAmount,
+          status: webhookTxStatus,
+          gatewayTxId: txId || targetOrder.paymentTxId || '',
+          note: `Webhook (${gateway.name}) marked food payment as ${nextPaymentStatus}`,
+        })
+        .onConflictDoNothing({ target: paymentTransactions.idempotencyKey });
+    }
+
     await db.insert(orderStatusHistory).values({
       orderId: targetOrder.id,
       status: targetOrder.status,
@@ -2239,6 +2756,9 @@ app.post('/api/payments/webhook/:code', async (req, res) => {
         riderName: updated[0].riderName,
         etaMinutes: updated[0].estimatedMinutes,
         createdAt: updated[0].createdAt,
+        paymentSplitMode: updated[0].paymentSplitMode,
+        onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+        cashDueToRider: updated[0].cashDueToRider,
         items: updated[0].itemsSnapshotJson,
       });
     }
@@ -3272,26 +3792,58 @@ app.patch(
         });
       }
 
-      const updated = await db
-        .update(orders)
-        .set({
-          status: parsed.data.status,
-          cancelReason:
-            parsed.data.status === 'cancelled' ? parsed.data.note || 'Cancelled by restaurant' : order.cancelReason,
-          updatedAt: new Date(),
-        })
-        .where(eq(orders.id, order.id))
-        .returning();
+      const prepaidCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentSplitMode: order.paymentSplitMode,
+        nextStatus: parsed.data.status,
+      });
+      if (!prepaidCheck.allowed) {
+        return res.status(400).json({ error: prepaidCheck.reason });
+      }
 
-      await db.insert(orderStatusHistory).values({
-        orderId: order.id,
-        status: parsed.data.status,
-        note: parsed.data.note || `Updated to ${parsed.data.status}`,
-        actorUid: req.user!.uid,
+      const updated = await db.transaction(async (tx) => {
+        const nextPaymentStatus =
+          parsed.data.status === 'cancelled'
+            ? order.paymentStatus === 'paid'
+              ? 'refunded'
+              : 'failed'
+            : order.paymentStatus;
+        const rows = await tx
+          .update(orders)
+          .set({
+            status: parsed.data.status,
+            paymentStatus: nextPaymentStatus,
+            cancelReason:
+              parsed.data.status === 'cancelled'
+                ? parsed.data.note || 'Cancelled by restaurant'
+                : order.cancelReason,
+            updatedAt: new Date(),
+          })
+          .where(eq(orders.id, order.id))
+          .returning();
+
+        await tx.insert(orderStatusHistory).values({
+          orderId: order.id,
+          status: parsed.data.status,
+          note: parsed.data.note || `Updated to ${parsed.data.status}`,
+          actorUid: req.user!.uid,
+        });
+
+        if (parsed.data.status === 'cancelled') {
+          await reverseOrderSplitFinancialsTx(
+            tx,
+            order,
+            parsed.data.note || 'Cancelled by restaurant'
+          );
+        }
+
+        return rows;
       });
 
       if (parsed.data.status === 'delivered') {
         await settleOrderCommissionIdempotent(order.id);
+        await recordRiderDeliveryWalletIdempotent(order.id, undefined, req.user!.uid);
       }
 
       await db.insert(notifications).values({
@@ -3327,6 +3879,9 @@ app.patch(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: parsed.data.status,
           statusNote: parsed.data.note || `${order.restaurantName} updated order status`,
@@ -3750,6 +4305,16 @@ app.post(
         });
       }
 
+      const prepaidAssignCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentSplitMode: order.paymentSplitMode,
+        nextStatus: 'rider_assigned',
+      });
+      if (!prepaidAssignCheck.allowed) {
+        return res.status(400).json({ error: prepaidAssignCheck.reason });
+      }
+
       let nextRiderUid: string | null = order.riderUid || null;
       let nextRiderName: string | null = order.riderName || null;
       let assignedRiderPhone = '';
@@ -3791,6 +4356,9 @@ app.post(
           .limit(1);
         if (riderRows.length === 0) {
           return res.status(404).json({ error: 'Selected rider not found' });
+        }
+        if (riderRows[0].status !== 'approved') {
+          return res.status(400).json({ error: 'Selected rider is pending Admin approval and cannot be assigned yet.' });
         }
         nextRiderUid = riderRows[0].uid;
         nextRiderName = riderRows[0].fullName;
@@ -3878,6 +4446,9 @@ app.post(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: updated[0].status,
           statusNote,
@@ -4711,45 +5282,65 @@ app.post('/api/riders/apply', async (req, res) => {
     const startLat = Number.isFinite(parsed.data.lat) ? Math.round((parsed.data.lat as number) * 1e6) / 1e6 : 23.7949;
     const startLng = Number.isFinite(parsed.data.lng) ? Math.round((parsed.data.lng as number) * 1e6) / 1e6 : 90.4144;
 
-    const inserted = await db
-      .insert(riders)
-      .values({
-        uid,
-        fullName: parsed.data.fullName,
-        phone: parsed.data.phone,
-        email: emailLower,
-        vehicleType: parsed.data.vehicleType,
-        zone: parsed.data.zone,
-        nidNumber: parsed.data.nidNumber,
-        currentLat: startLat,
-        currentLng: startLng,
-        locationUpdatedAt: new Date(),
-        isAvailable: true,
-        status: 'approved',
-      })
-      .onConflictDoUpdate({
-        target: riders.uid,
-        set: {
-          fullName: parsed.data.fullName,
-          phone: parsed.data.phone,
-          email: emailLower,
-          vehicleType: parsed.data.vehicleType,
-          zone: parsed.data.zone,
-          nidNumber: parsed.data.nidNumber,
-          currentLat: startLat,
-          currentLng: startLng,
-          locationUpdatedAt: new Date(),
-          isAvailable: true,
-          status: 'approved',
-        },
-      })
-      .returning();
+    const existingRider = await db
+      .select()
+      .from(riders)
+      .where(eq(riders.uid, uid))
+      .limit(1);
+
+    const inserted =
+      existingRider.length > 0
+        ? await db
+            .update(riders)
+            .set({
+              fullName: parsed.data.fullName,
+              phone: parsed.data.phone,
+              email: emailLower,
+              vehicleType: parsed.data.vehicleType,
+              zone: parsed.data.zone,
+              nidNumber: parsed.data.nidNumber,
+              currentLat: startLat,
+              currentLng: startLng,
+              locationUpdatedAt: new Date(),
+            })
+            .where(eq(riders.uid, uid))
+            .returning()
+        : await db
+            .insert(riders)
+            .values({
+              uid,
+              fullName: parsed.data.fullName,
+              phone: parsed.data.phone,
+              email: emailLower,
+              vehicleType: parsed.data.vehicleType,
+              zone: parsed.data.zone,
+              nidNumber: parsed.data.nidNumber,
+              currentLat: startLat,
+              currentLng: startLng,
+              locationUpdatedAt: new Date(),
+              isAvailable: false,
+              status: 'pending',
+            })
+            .returning();
+
+    const adminNotifTitle =
+      existingRider.length > 0
+        ? `Rider Profile Updated · ${parsed.data.zone}`
+        : `New Rider Application Pending Approval · ${parsed.data.zone}`;
+    const adminNotifMsg = `${parsed.data.fullName} (${parsed.data.vehicleType}) applied for ${parsed.data.zone}. Review and approve in Admin Panel.`;
 
     await db.insert(notifications).values({
       recipientUid: 'demo-admin-uid',
       roleTarget: 'super_admin',
-      title: 'New Delivery Rider Joined',
-      message: `${parsed.data.fullName} (${parsed.data.vehicleType}) joined for ${parsed.data.zone}, Bangladesh.`,
+      title: adminNotifTitle,
+      message: adminNotifMsg,
+      type: 'system',
+    });
+    broadcastNotificationEvent({
+      recipientUid: 'role-super_admin',
+      roleTarget: 'super_admin',
+      title: adminNotifTitle,
+      message: adminNotifMsg,
       type: 'system',
     });
 
@@ -4796,36 +5387,62 @@ app.post('/api/riders/register', requireAuth, async (req: AuthRequest, res) => {
     const startLat = Number.isFinite(parsed.data.lat) ? Math.round((parsed.data.lat as number) * 1e6) / 1e6 : 23.7949;
     const startLng = Number.isFinite(parsed.data.lng) ? Math.round((parsed.data.lng as number) * 1e6) / 1e6 : 90.4144;
 
-    const inserted = await db
-      .insert(riders)
-      .values({
-        uid: req.user!.uid,
-        fullName: parsed.data.fullName,
-        phone: parsed.data.phone,
-        email: parsed.data.email.trim().toLowerCase(),
-        vehicleType: parsed.data.vehicleType,
-        zone: parsed.data.zone,
-        nidNumber: parsed.data.nidNumber,
-        currentLat: startLat,
-        currentLng: startLng,
-        locationUpdatedAt: new Date(),
-        isAvailable: true,
-        status: 'approved',
-      })
-      .onConflictDoUpdate({
-        target: riders.uid,
-        set: {
-          fullName: parsed.data.fullName,
-          phone: parsed.data.phone,
-          vehicleType: parsed.data.vehicleType,
-          zone: parsed.data.zone,
-          nidNumber: parsed.data.nidNumber,
-          currentLat: startLat,
-          currentLng: startLng,
-          locationUpdatedAt: new Date(),
-        },
-      })
-      .returning();
+    const existingRider = await db
+      .select()
+      .from(riders)
+      .where(eq(riders.uid, req.user!.uid))
+      .limit(1);
+
+    const inserted =
+      existingRider.length > 0
+        ? await db
+            .update(riders)
+            .set({
+              fullName: parsed.data.fullName,
+              phone: parsed.data.phone,
+              vehicleType: parsed.data.vehicleType,
+              zone: parsed.data.zone,
+              nidNumber: parsed.data.nidNumber,
+              currentLat: startLat,
+              currentLng: startLng,
+              locationUpdatedAt: new Date(),
+            })
+            .where(eq(riders.uid, req.user!.uid))
+            .returning()
+        : await db
+            .insert(riders)
+            .values({
+              uid: req.user!.uid,
+              fullName: parsed.data.fullName,
+              phone: parsed.data.phone,
+              email: parsed.data.email.trim().toLowerCase(),
+              vehicleType: parsed.data.vehicleType,
+              zone: parsed.data.zone,
+              nidNumber: parsed.data.nidNumber,
+              currentLat: startLat,
+              currentLng: startLng,
+              locationUpdatedAt: new Date(),
+              isAvailable: false,
+              status: 'pending',
+            })
+            .returning();
+
+    if (existingRider.length === 0) {
+      await db.insert(notifications).values({
+        recipientUid: 'demo-admin-uid',
+        roleTarget: 'super_admin',
+        title: `New Rider Application Pending Approval · ${parsed.data.zone}`,
+        message: `${parsed.data.fullName} (${parsed.data.vehicleType}) applied for ${parsed.data.zone}.`,
+        type: 'system',
+      });
+      broadcastNotificationEvent({
+        recipientUid: 'role-super_admin',
+        roleTarget: 'super_admin',
+        title: `New Rider Application Pending Approval · ${parsed.data.zone}`,
+        message: `${parsed.data.fullName} (${parsed.data.vehicleType}) applied for ${parsed.data.zone}.`,
+        type: 'system',
+      });
+    }
 
     let nextUser = req.user!;
     if (req.user!.role === 'customer') {
@@ -5058,7 +5675,44 @@ app.post(
         return res.status(409).json({ error: 'Order has already been claimed by another rider.' });
       }
 
+      const prepaidRiderCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: existingOrder.paymentMethod,
+        paymentStatus: existingOrder.paymentStatus,
+        paymentSplitMode: existingOrder.paymentSplitMode,
+        nextStatus: 'rider_assigned',
+      });
+      if (!prepaidRiderCheck.allowed) {
+        return res.status(400).json({ error: prepaidRiderCheck.reason });
+      }
+
       const riderRows = await db.select().from(riders).where(eq(riders.uid, riderUid)).limit(1);
+      const isAdminCaller = req.user!.role === 'super_admin' || req.user!.role === 'admin';
+      if (!isAdminCaller) {
+        const settingsRows = await db.select().from(platformSettings).limit(1);
+        const financialConfig = mergeDeliveryFinancialConfig(settingsRows[0]?.deliveryFinancialConfig);
+        const ledgerRows = await db
+          .select()
+          .from(riderWalletLedger)
+          .where(eq(riderWalletLedger.riderUid, riderUid));
+        const walletSummary = summarizeRiderWalletLedger(
+          ledgerRows.map((e) => ({
+            entryType: e.entryType,
+            cashCollected: e.cashCollected,
+            riderEarningDelta: e.riderEarningDelta,
+            commissionOwedDelta: e.commissionOwedDelta,
+            commissionSettledDelta: e.commissionSettledDelta,
+          }))
+        );
+        const riderAcceptCheck = canRiderAcceptOrders({
+          riderStatus: riderRows[0]?.status,
+          outstandingCommission: walletSummary.outstandingCommission,
+          settlementRules: financialConfig.settlementRules,
+        });
+        if (!riderAcceptCheck.allowed) {
+          return res.status(403).json({ error: riderAcceptCheck.reason });
+        }
+      }
+
       const riderName = riderRows[0]?.fullName || req.user!.fullName;
 
       const updated = await db
@@ -5118,6 +5772,9 @@ app.post(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: 'rider_assigned',
           statusNote: `Rider ${riderName} accepted delivery assignment`,
@@ -5228,6 +5885,16 @@ app.patch(
           .json({ error: `Cannot change order from ${order.status} to ${parsed.data.status}` });
       }
 
+      const prepaidCheck = canVendorProcessPrepaidOrder({
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentSplitMode: order.paymentSplitMode,
+        nextStatus: parsed.data.status,
+      });
+      if (!prepaidCheck.allowed) {
+        return res.status(400).json({ error: prepaidCheck.reason });
+      }
+
       const updated = await db
         .update(orders)
         .set({
@@ -5274,15 +5941,11 @@ app.patch(
 
       if (parsed.data.status === 'delivered') {
         await settleOrderCommissionIdempotent(order.id);
-        if (order.riderUid) {
-          await db
-            .update(riders)
-            .set({
-              totalDeliveries: sql`${riders.totalDeliveries} + 1`,
-              totalEarnings: sql`${riders.totalEarnings} + ${Math.max(40, order.deliveryFee)}`,
-            })
-            .where(eq(riders.uid, order.riderUid));
-        }
+        await recordRiderDeliveryWalletIdempotent(
+          order.id,
+          parsed.data.collectedCashAmount,
+          req.user!.uid
+        );
       }
 
       const restOwnerRows = await db
@@ -5322,6 +5985,9 @@ app.patch(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: parsed.data.status,
           statusNote: statusLabels[parsed.data.status] || 'Delivery Update',
@@ -5859,30 +6525,53 @@ app.patch(
         }
       }
 
-      const updated = await db
-        .update(orders)
-        .set({
-          status: parsed.data.status,
-          riderUid: nextRiderUid,
-          riderName: nextRiderName,
-          paymentStatus:
-            parsed.data.status === 'delivered' && order.paymentMethod === 'cod'
-              ? 'paid'
-              : order.paymentStatus,
-          updatedAt: new Date(),
-        })
-        .where(eq(orders.id, orderId))
-        .returning();
+      const updated = await db.transaction(async (tx) => {
+        const nextPaymentStatus =
+          parsed.data.status === 'delivered' && order.paymentMethod === 'cod'
+            ? 'paid'
+            : parsed.data.status === 'cancelled'
+            ? order.paymentStatus === 'paid'
+              ? 'refunded'
+              : 'failed'
+            : order.paymentStatus;
 
-      await db.insert(orderStatusHistory).values({
-        orderId,
-        status: parsed.data.status,
-        note: parsed.data.note || `Admin updated status to ${parsed.data.status.replace(/_/g, ' ')}`,
-        actorUid: req.user!.uid,
+        const rows = await tx
+          .update(orders)
+          .set({
+            status: parsed.data.status,
+            riderUid: nextRiderUid,
+            riderName: nextRiderName,
+            paymentStatus: nextPaymentStatus,
+            cancelReason:
+              parsed.data.status === 'cancelled'
+                ? parsed.data.note || 'Cancelled by Admin'
+                : order.cancelReason,
+            updatedAt: new Date(),
+          })
+          .where(eq(orders.id, orderId))
+          .returning();
+
+        await tx.insert(orderStatusHistory).values({
+          orderId,
+          status: parsed.data.status,
+          note: parsed.data.note || `Admin updated status to ${parsed.data.status.replace(/_/g, ' ')}`,
+          actorUid: req.user!.uid,
+        });
+
+        if (parsed.data.status === 'cancelled') {
+          await reverseOrderSplitFinancialsTx(
+            tx,
+            order,
+            parsed.data.note || 'Cancelled by Admin'
+          );
+        }
+
+        return rows;
       });
 
       if (parsed.data.status === 'delivered') {
         await settleOrderCommissionIdempotent(orderId);
+        await recordRiderDeliveryWalletIdempotent(orderId, undefined, req.user!.uid);
       }
 
       await db.insert(auditLogs).values({
@@ -5930,6 +6619,9 @@ app.patch(
           totalAmount: updated[0].totalAmount,
           paymentMethod: updated[0].paymentMethod,
           paymentStatus: updated[0].paymentStatus,
+          paymentSplitMode: updated[0].paymentSplitMode,
+          onlineFoodPaidAmount: updated[0].onlineFoodPaidAmount,
+          cashDueToRider: updated[0].cashDueToRider,
           status: updated[0].status,
           statusEvent: parsed.data.status,
           statusNote:
@@ -6059,6 +6751,12 @@ app.patch(
           actorUid: req.user!.uid,
         });
 
+        await reverseOrderSplitFinancialsTx(
+          tx,
+          order,
+          req.body.reason || 'Cancelled & refunded by Super Admin'
+        );
+
         await tx.insert(auditLogs).values({
           actorUid: req.user!.uid,
           action: 'order_refund',
@@ -6100,6 +6798,9 @@ app.patch(
           totalAmount: result.totalAmount,
           paymentMethod: result.paymentMethod,
           paymentStatus: result.paymentStatus,
+          paymentSplitMode: result.paymentSplitMode,
+          onlineFoodPaidAmount: result.onlineFoodPaidAmount,
+          cashDueToRider: result.cashDueToRider,
           status: result.status,
           statusEvent: 'cancelled',
           statusNote: result.cancelReason || 'Order cancelled & refunded by Admin',
@@ -6439,13 +7140,21 @@ app.patch(
 
       const hasCoords =
         typeof parsed.data.currentLat === 'number' || typeof parsed.data.currentLng === 'number';
+      const nextStatus = parsed.data.status ?? cur.status;
+      const nextIsAvailable =
+        typeof parsed.data.isAvailable === 'boolean'
+          ? parsed.data.isAvailable
+          : parsed.data.status === 'approved' && cur.status === 'pending'
+          ? true
+          : parsed.data.status === 'suspended'
+          ? false
+          : cur.isAvailable;
 
       const updated = await db
         .update(riders)
         .set({
-          status: parsed.data.status ?? cur.status,
-          isAvailable:
-            typeof parsed.data.isAvailable === 'boolean' ? parsed.data.isAvailable : cur.isAvailable,
+          status: nextStatus,
+          isAvailable: nextIsAvailable,
           zone: parsed.data.zone ? parsed.data.zone : cur.zone,
           vehicleType: parsed.data.vehicleType ? parsed.data.vehicleType : cur.vehicleType,
           currentLat:
@@ -6461,6 +7170,36 @@ app.patch(
         .where(eq(riders.id, id))
         .returning();
 
+      if (parsed.data.status && parsed.data.status !== cur.status) {
+        const statusTitle =
+          parsed.data.status === 'approved'
+            ? `Rider Account Approved · ${updated[0].zone}`
+            : parsed.data.status === 'suspended'
+            ? 'Rider Account Suspended'
+            : 'Rider Status Set to Pending';
+        const statusMsg =
+          parsed.data.status === 'approved'
+            ? `Welcome! You are now approved to accept deliveries in ${updated[0].zone}.`
+            : parsed.data.status === 'suspended'
+            ? 'Your rider dispatch access has been suspended by Admin.'
+            : 'Your rider application is under Admin review.';
+
+        await db.insert(notifications).values({
+          recipientUid: updated[0].uid,
+          roleTarget: 'rider',
+          title: statusTitle,
+          message: statusMsg,
+          type: 'system',
+        });
+        broadcastNotificationEvent({
+          recipientUid: updated[0].uid,
+          roleTarget: 'rider',
+          title: statusTitle,
+          message: statusMsg,
+          type: 'system',
+        });
+      }
+
       await db.insert(auditLogs).values({
         actorUid: req.user!.uid,
         action: hasCoords ? 'rider_gps_override' : 'rider_updated',
@@ -6472,6 +7211,182 @@ app.patch(
       res.json({ rider: updated[0] });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
+    }
+  }
+);
+
+app.patch(
+  '/api/admin/delivery-financial-config',
+  requireAuth,
+  requireRole(['admin', 'super_admin']),
+  async (req: AuthRequest, res) => {
+    try {
+      const existing = await db.select().from(platformSettings).limit(1);
+      if (existing.length === 0) return res.status(404).json({ error: 'Platform settings missing' });
+      const cur = existing[0];
+      const currentMerged = mergeDeliveryFinancialConfig(cur.deliveryFinancialConfig);
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const nextConfig = mergeDeliveryFinancialConfig({
+        zoneFees: { ...currentMerged.zoneFees, ...(body.zoneFees || {}) },
+        distancePricing: { ...currentMerged.distancePricing, ...(body.distancePricing || {}) },
+        riderEarningRule: { ...currentMerged.riderEarningRule, ...(body.riderEarningRule || {}) },
+        settlementRules: { ...currentMerged.settlementRules, ...(body.settlementRules || {}) },
+      });
+
+      await db
+        .update(platformSettings)
+        .set({
+          deliveryFinancialConfig: nextConfig as unknown as Record<string, unknown>,
+          updatedAt: new Date(),
+        })
+        .where(eq(platformSettings.id, cur.id));
+
+      await db.insert(auditLogs).values({
+        actorUid: req.user!.uid,
+        action: 'delivery_financial_config_updated',
+        targetType: 'platform_settings',
+        targetId: String(cur.id),
+        details: JSON.stringify(nextConfig),
+      });
+
+      res.json({ deliveryFinancialConfig: nextConfig });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to update delivery financial config' });
+    }
+  }
+);
+
+app.post(
+  '/api/admin/riders/:uid/settle-commission',
+  requireAuth,
+  requireRole(['admin', 'super_admin']),
+  async (req: AuthRequest, res) => {
+    const riderUid = String(req.params.uid || '').trim();
+    const schema = z.object({
+      amount: z.number().int().positive(),
+      method: z.string().trim().min(2).max(40).default('cash'),
+      referenceId: z.string().trim().max(80).optional(),
+      note: z.string().trim().max(240).optional(),
+    });
+    const parsed = schema.safeParse(req.body || {});
+    if (!riderUid || !parsed.success) {
+      return res.status(400).json({ error: 'Valid positive settlement amount required' });
+    }
+
+    try {
+      const riderRows = await db.select().from(riders).where(eq(riders.uid, riderUid)).limit(1);
+      if (riderRows.length === 0) return res.status(404).json({ error: 'Rider not found' });
+
+      const existingEntries = await db
+        .select()
+        .from(riderWalletLedger)
+        .where(eq(riderWalletLedger.riderUid, riderUid));
+      const summaryBefore = summarizeRiderWalletLedger(
+        existingEntries.map((e) => ({
+          entryType: e.entryType,
+          cashCollected: e.cashCollected,
+          riderEarningDelta: e.riderEarningDelta,
+          commissionOwedDelta: e.commissionOwedDelta,
+          commissionSettledDelta: e.commissionSettledDelta,
+        }))
+      );
+
+      if (summaryBefore.outstandingCommission <= 0) {
+        return res.status(400).json({ error: 'This rider has no outstanding Foodora commission owed.' });
+      }
+      if (parsed.data.amount > summaryBefore.outstandingCommission) {
+        return res.status(400).json({
+          error: `Settlement amount (৳${parsed.data.amount}) exceeds outstanding commission owed (৳${summaryBefore.outstandingCommission}).`,
+        });
+      }
+
+      const ref =
+        parsed.data.referenceId?.trim() ||
+        `STL-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+      const idempotencyKey = `settle:${riderUid}:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`;
+
+      const inserted = await db
+        .insert(riderWalletLedger)
+        .values({
+          riderUid,
+          orderId: null,
+          orderNumber: '',
+          entryType: 'commission_settled',
+          idempotencyKey,
+          cashCollected: 0,
+          riderEarningDelta: 0,
+          commissionOwedDelta: 0,
+          commissionSettledDelta: parsed.data.amount,
+          referenceId: ref,
+          note:
+            parsed.data.note?.trim() ||
+            `Commission settled (${parsed.data.method}) · Recorded by Admin`,
+        })
+        .returning();
+
+      await db.insert(notifications).values({
+        recipientUid: riderUid,
+        roleTarget: 'rider',
+        title: `Commission Settled · ৳${parsed.data.amount}`,
+        message: `Admin recorded your Foodora commission settlement of ৳${parsed.data.amount} (${ref}).`,
+        type: 'system',
+      });
+      broadcastNotificationEvent({
+        recipientUid: riderUid,
+        roleTarget: 'rider',
+        title: `Commission Settled · ৳${parsed.data.amount}`,
+        message: `Admin recorded your Foodora commission settlement of ৳${parsed.data.amount} (${ref}).`,
+        type: 'system',
+      });
+
+      await db.insert(auditLogs).values({
+        actorUid: req.user!.uid,
+        action: 'rider_commission_settled',
+        targetType: 'rider',
+        targetId: riderUid,
+        details: JSON.stringify({ amount: parsed.data.amount, method: parsed.data.method, referenceId: ref }),
+      });
+
+      const updatedSummary = summarizeRiderWalletLedger([
+        ...existingEntries.map((e) => ({
+          entryType: e.entryType,
+          cashCollected: e.cashCollected,
+          riderEarningDelta: e.riderEarningDelta,
+          commissionOwedDelta: e.commissionOwedDelta,
+          commissionSettledDelta: e.commissionSettledDelta,
+        })),
+        {
+          entryType: 'commission_settled',
+          cashCollected: 0,
+          riderEarningDelta: 0,
+          commissionOwedDelta: 0,
+          commissionSettledDelta: parsed.data.amount,
+        },
+      ]);
+
+      res.status(201).json({
+        entry: inserted[0],
+        walletSummary: updatedSummary,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to settle rider commission' });
+    }
+  }
+);
+
+app.get(
+  '/api/admin/transactions',
+  requireAuth,
+  requireRole(['admin', 'super_admin']),
+  async (_req: AuthRequest, res) => {
+    try {
+      const [txRows, walletRows] = await Promise.all([
+        db.select().from(paymentTransactions).orderBy(desc(paymentTransactions.id)).limit(250),
+        db.select().from(riderWalletLedger).orderBy(desc(riderWalletLedger.id)).limit(250),
+      ]);
+      res.json({ paymentTransactions: txRows, riderWalletLedger: walletRows });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to load financial transactions' });
     }
   }
 );
@@ -7322,18 +8237,18 @@ function extractReadableGeminiError(err: unknown): { status: number; message: st
     typeof (err as { status?: unknown })?.status === 'number'
       ? (err as { status: number }).status
       : 502;
-  const rawMsg = err instanceof Error ? err.message : 'Failed to generate AI Help response.';
+  const rawMsg = coerceSafeErrorText(err, 'Failed to generate AI Help response.');
 
   let parsedMessage = rawMsg;
   let parsedStatus = rawStatus;
   if (rawMsg.trim().startsWith('{')) {
     try {
       const obj = JSON.parse(rawMsg) as {
-        error?: { code?: number; message?: string; status?: string };
-        message?: string;
+        error?: { code?: number; message?: unknown; status?: string };
+        message?: unknown;
       };
-      if (obj.error?.message) parsedMessage = obj.error.message;
-      else if (obj.message) parsedMessage = obj.message;
+      const candidate = coerceSafeErrorText(obj.error?.message ?? obj.message, '');
+      if (candidate) parsedMessage = candidate;
       if (typeof obj.error?.code === 'number') parsedStatus = obj.error.code;
     } catch {
       // keep rawMsg
@@ -7342,7 +8257,7 @@ function extractReadableGeminiError(err: unknown): { status: number; message: st
 
   return {
     status: parsedStatus >= 400 && parsedStatus < 600 ? parsedStatus : 502,
-    message: parsedMessage,
+    message: coerceSafeErrorText(parsedMessage, 'Failed to generate AI Help response.'),
   };
 }
 
@@ -7414,12 +8329,13 @@ async function runSingleOpenRouterRequest(options: {
       error?: { message?: string };
     };
     if (!res.ok) {
-      const err = new Error(json?.error?.message || `OpenRouter API failed (${res.status})`);
+      const errMsg = coerceSafeErrorText(json?.error?.message ?? json?.error, `OpenRouter API failed (${res.status})`);
+      const err = new Error(errMsg);
       (err as Error & { status?: number }).status = res.status;
       throw err;
     }
     const msg = json?.choices?.[0]?.message;
-    const text = (msg?.content || '').trim();
+    const text = extractAiReplyText(msg?.content);
     if (!text) {
       const err = new Error('OpenRouter returned an empty response.');
       (err as Error & { status?: number }).status = 502;
@@ -7481,11 +8397,11 @@ async function callExternalAiProvider(options: {
         error?: { message?: string };
       };
       if (!res.ok) {
-        const err = new Error(json?.error?.message || `Pollinations AI failed (${res.status})`);
+        const err = new Error(coerceSafeErrorText(json?.error?.message ?? json?.error, `Pollinations AI failed (${res.status})`));
         (err as Error & { status?: number }).status = res.status;
         throw err;
       }
-      const text = (json?.choices?.[0]?.message?.content || '').trim();
+      const text = extractAiReplyText(json?.choices?.[0]?.message?.content);
       if (!text) throw new Error('Pollinations AI returned an empty response.');
       return { reply: text, actualModel: options.model || 'openai-fast' };
     } finally {
@@ -7571,11 +8487,11 @@ async function callExternalAiProvider(options: {
         error?: { message?: string };
       };
       if (!res.ok) {
-        const err = new Error(json?.error?.message || `Anthropic API failed (${res.status})`);
+        const err = new Error(coerceSafeErrorText(json?.error?.message ?? json?.error, `Anthropic API failed (${res.status})`));
         (err as Error & { status?: number }).status = res.status;
         throw err;
       }
-      const text = (json?.content?.[0]?.text || '').trim();
+      const text = extractAiReplyText(json?.content);
       if (!text) throw new Error('Anthropic returned an empty response.');
       return { reply: text, actualModel: options.model };
     }
@@ -7602,15 +8518,15 @@ async function callExternalAiProvider(options: {
       }),
     });
     const json = (await res.json().catch(() => ({}))) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      error?: { message?: string };
+      choices?: Array<{ message?: { content?: unknown } }>;
+      error?: { message?: unknown };
     };
     if (!res.ok) {
-      const err = new Error(json?.error?.message || `AI API failed (${res.status})`);
+      const err = new Error(coerceSafeErrorText(json?.error?.message ?? json?.error, `AI API failed (${res.status})`));
       (err as Error & { status?: number }).status = res.status;
       throw err;
     }
-    const text = (json?.choices?.[0]?.message?.content || '').trim();
+    const text = extractAiReplyText(json?.choices?.[0]?.message?.content);
     if (!text) throw new Error('AI API returned an empty response.');
     return { reply: text, actualModel: options.model };
   } finally {
@@ -7955,13 +8871,7 @@ async function runGeminiHelpCompletion(params: {
     },
   ];
 
-  const candidateModels = Array.from(
-    new Set(
-      [params.preferredModel, 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'].filter(
-        (m) => Boolean(m && m.trim() && m !== 'foodora-bd-assistant' && !m.includes('gemini-2.5'))
-      )
-    )
-  );
+  const candidateModels = filterGeminiCandidateModels(params.preferredModel);
 
   let lastError: unknown = null;
   for (let i = 0; i < candidateModels.length; i += 1) {

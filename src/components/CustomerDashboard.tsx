@@ -2,7 +2,12 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Bell, Heart, MapPin, Package, Plus, Star, User, Volume2, VolumeX, X } from 'lucide-react';
 import { apiFetch, getAuthToken } from '../lib/api';
 import { BANGLADESH_AREAS, getBangladeshAreaSelectPresets } from '../lib/i18n';
-import { detectOrderBatchChanges, formatBdt, formatResolvedMapAddress } from '../lib/marketplace-logic';
+import {
+  detectOrderBatchChanges,
+  formatBdt,
+  formatDurationEstimate,
+  formatResolvedMapAddress,
+} from '../lib/marketplace-logic';
 import { playOrderAlertChime, useOrderSoundSetting, useRealtimeEvents } from '../lib/realtime';
 import { DhakaMapPicker } from './DhakaMapPicker';
 import { SelectWithCustom } from './SelectWithCustom';
@@ -557,7 +562,7 @@ export function CustomerDashboard({
                       </span>
                     </div>
                     <p className="text-xs text-neutral-500 mt-1">
-                      {rest.cuisine} · {rest.area} · {rest.deliveryTimeMin} mins
+                      {rest.cuisine} · {rest.area} · {formatDurationEstimate(rest.deliveryTimeMin, lang)}
                     </p>
                   </div>
                   <button

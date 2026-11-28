@@ -82,6 +82,59 @@ export function toBengaliDigits(input: string | number): string {
   return String(input).replace(/\d/g, (d) => bnDigits[Number(d)] ?? d);
 }
 
+/**
+ * Formats a minute duration cleanly so 60+ minutes automatically reads as hours + minutes
+ * (e.g. 417 mins -> "6 hr 57 min" in EN or "৬ ঘণ্টা ৫৭ মিনিট" in BN).
+ */
+export function formatDurationEstimate(
+  minutes: number,
+  lang: 'en' | 'bn' = 'en',
+  style: 'default' | 'compact' = 'default'
+): string {
+  const safeMins = Number.isFinite(minutes) ? Math.max(0, Math.round(minutes)) : 0;
+  const formatNum = (val: number) => (lang === 'bn' ? toBengaliDigits(val) : String(val));
+
+  if (safeMins === 0) {
+    return lang === 'bn' ? '০ মিনিট' : style === 'compact' ? '0 min' : '0 mins';
+  }
+
+  if (safeMins < 60) {
+    if (lang === 'bn') {
+      return `${formatNum(safeMins)} মিনিট`;
+    }
+    return style === 'compact' || safeMins === 1
+      ? `${safeMins} min`
+      : `${safeMins} mins`;
+  }
+
+  const days = Math.floor(safeMins / 1440);
+  const remAfterDays = safeMins % 1440;
+  const hours = Math.floor(remAfterDays / 60);
+  const mins = remAfterDays % 60;
+
+  if (days > 0) {
+    const partsEn: string[] = [`${days}d`];
+    const partsBn: string[] = [`${formatNum(days)} দিন`];
+    if (hours > 0) {
+      partsEn.push(`${hours} hr`);
+      partsBn.push(`${formatNum(hours)} ঘণ্টা`);
+    }
+    if (mins > 0 && style !== 'compact') {
+      partsEn.push(`${mins} min`);
+      partsBn.push(`${formatNum(mins)} মিনিট`);
+    }
+    return lang === 'bn' ? partsBn.join(' ') : partsEn.join(' ');
+  }
+
+  const partsEn: string[] = [`${hours} hr`];
+  const partsBn: string[] = [`${formatNum(hours)} ঘণ্টা`];
+  if (mins > 0) {
+    partsEn.push(`${mins} min`);
+    partsBn.push(`${formatNum(mins)} মিনিট`);
+  }
+  return lang === 'bn' ? partsBn.join(' ') : partsEn.join(' ');
+}
+
 export function calculateCartItemUnitPrice(item: Pick<CartItemInput, 'basePrice' | 'discountPrice' | 'variationDelta' | 'addons'>): number {
   const effectiveBase =
     item.discountPrice !== null && item.discountPrice !== undefined && item.discountPrice > 0
@@ -969,7 +1022,8 @@ export function buildRobotsTxt(origin: string): string {
 
 export function buildSitemapXml(
   origin: string,
-  restaurants: Array<{ slug: string; updatedAt?: string | Date | null }>
+  restaurants: Array<{ slug: string; updatedAt?: string | Date | null }>,
+  options?: { areas?: string[]; cuisines?: string[] }
 ): string {
   const cleanOrigin = origin.replace(/\/+$/, '');
   const today = new Date().toISOString().slice(0, 10);
@@ -998,7 +1052,29 @@ export function buildSitemapXml(
       loc: `${cleanOrigin}/?restaurant=${encodeURIComponent(slug)}`,
       lastmod,
       changefreq: 'daily',
+      priority: '0.9',
+    });
+  }
+
+  for (const area of options?.areas || []) {
+    const clean = String(area || '').trim();
+    if (!clean) continue;
+    urls.push({
+      loc: `${cleanOrigin}/?area=${encodeURIComponent(clean)}`,
+      lastmod: today,
+      changefreq: 'weekly',
       priority: '0.8',
+    });
+  }
+
+  for (const cuisine of options?.cuisines || []) {
+    const clean = String(cuisine || '').trim();
+    if (!clean) continue;
+    urls.push({
+      loc: `${cleanOrigin}/?cuisine=${encodeURIComponent(clean)}`,
+      lastmod: today,
+      changefreq: 'weekly',
+      priority: '0.7',
     });
   }
 
@@ -1517,6 +1593,9 @@ export function buildOrderTrackingEmailPayload(input: {
   riderPhone?: string | null;
   etaMinutes?: number | null;
   createdAt?: string | Date | null;
+  paymentSplitMode?: string | null;
+  onlineFoodPaidAmount?: number | null;
+  cashDueToRider?: number | null;
   items?: Array<{
     foodItemId?: number;
     name: string;
@@ -1638,7 +1717,7 @@ export function buildOrderTrackingEmailPayload(input: {
     : '';
   const etaLine =
     typeof input.etaMinutes === 'number' && input.etaMinutes > 0 && input.status !== 'delivered' && input.status !== 'cancelled'
-      ? `<p style="margin:4px 0;"><strong>Estimated Arrival:</strong> ~${input.etaMinutes} mins</p>`
+      ? `<p style="margin:4px 0;"><strong>Estimated Arrival:</strong> ~${formatDurationEstimate(input.etaMinutes, 'en')}</p>`
       : '';
   const addressLine = input.deliveryAddress
     ? `<p style="margin:4px 0;"><strong>Delivery Address:</strong> ${escapeXml(input.deliveryAddress)}</p>`
@@ -1656,6 +1735,18 @@ export function buildOrderTrackingEmailPayload(input: {
   const deliveryFeeVal = Math.max(0, Number(input.deliveryFee ?? 0));
   const serviceFeeVal = Math.max(0, Number(input.serviceFee ?? 0));
   const taxVal = Math.max(0, Number(input.taxAmount ?? 0));
+
+  const isSplitOrder =
+    input.paymentSplitMode === 'online_food_cash_delivery' ||
+    (typeof input.onlineFoodPaidAmount === 'number' && typeof input.cashDueToRider === 'number');
+  const onlineFoodPart =
+    typeof input.onlineFoodPaidAmount === 'number'
+      ? Math.max(0, Math.round(input.onlineFoodPaidAmount))
+      : Math.max(0, Math.round(input.totalAmount - deliveryFeeVal));
+  const cashRiderPart =
+    typeof input.cashDueToRider === 'number'
+      ? Math.max(0, Math.round(input.cashDueToRider))
+      : deliveryFeeVal;
 
   const itemsBlock =
     itemsList.length > 0
@@ -1713,7 +1804,7 @@ export function buildOrderTrackingEmailPayload(input: {
              }
              ${
                typeof input.deliveryFee === 'number'
-                 ? `<p style="margin:2px 0;"><span>Delivery Fee:</span> <strong style="float:right;">৳${deliveryFeeVal}</strong></p>`
+                 ? `<p style="margin:2px 0;"><span>Delivery Fee${isSplitOrder ? ' (Cash to Rider)' : ''}:</span> <strong style="float:right;">৳${deliveryFeeVal}</strong></p>`
                  : ''
              }
              ${
@@ -1726,7 +1817,13 @@ export function buildOrderTrackingEmailPayload(input: {
                  ? `<p style="margin:2px 0;"><span>VAT / Tax:</span> <strong style="float:right;">৳${taxVal}</strong></p>`
                  : ''
              }
-             <p style="margin:6px 0 0;padding-top:6px;border-top:1px dashed #FBCFE8;font-size:13px;color:#E21B70;"><span><strong>Total Payable:</strong></span> <strong style="float:right;">৳${input.totalAmount}</strong></p>
+             ${
+               isSplitOrder
+                 ? `<p style="margin:4px 0;color:#059669;"><span>Online Food Payment (${escapeXml(input.paymentMethod.toUpperCase())}):</span> <strong style="float:right;">৳${onlineFoodPart}</strong></p>
+                    <p style="margin:4px 0;color:#B45309;"><span>Pay Cash to Rider (Delivery Charge):</span> <strong style="float:right;">৳${cashRiderPart}</strong></p>`
+                 : ''
+             }
+             <p style="margin:6px 0 0;padding-top:6px;border-top:1px dashed #FBCFE8;font-size:13px;color:#E21B70;"><span><strong>${isSplitOrder ? 'Customer Total Cost:' : 'Total Payable:'}</strong></span> <strong style="float:right;">৳${input.totalAmount}</strong></p>
            </div>
          </div>`
       : '';
@@ -1775,6 +1872,11 @@ export function buildOrderTrackingEmailPayload(input: {
           <p style="margin:4px 0;"><strong>Delivery Area:</strong> ${escapeXml(input.deliveryArea)}</p>
           ${addressLine}
           <p style="margin:4px 0;"><strong>Payment:</strong> ${escapeXml(input.paymentMethod.toUpperCase())}${paymentBadge} · <strong>Total: ৳${input.totalAmount}</strong></p>
+          ${
+            isSplitOrder
+              ? `<p style="margin:4px 0;color:#059669;"><strong>Online Food Payment:</strong> ৳${onlineFoodPart} · <strong style="color:#B45309;">Cash to Rider (Delivery):</strong> ৳${cashRiderPart}</p>`
+              : ''
+          }
           ${etaLine}
           ${riderLine}
           ${noteLine}
@@ -1800,13 +1902,17 @@ export function buildOrderTrackingEmailPayload(input: {
         }`
       : '';
 
+  const splitSummaryText = isSplitOrder
+    ? `\nOnline Food Payment: BDT ${onlineFoodPart}\nCash to Rider (Delivery Charge): BDT ${cashRiderPart}`
+    : '';
+
   const text = `Foodora BD — Invoice ${invoiceNumber} | Order ${input.orderNumber} (${info.en} / ${info.bn})
 ${info.subEn}
 ${info.subBn}
 Restaurant: ${input.restaurantName}
-Delivery Area: ${input.deliveryArea}${input.deliveryAddress ? `\nAddress: ${input.deliveryAddress}` : ''}${itemsText}
+Delivery Area: ${input.deliveryArea}${input.deliveryAddress ? `\nAddress: ${input.deliveryAddress}` : ''}${itemsText}${splitSummaryText}
 Total: BDT ${input.totalAmount} (${input.paymentMethod.toUpperCase()}${input.paymentStatus ? ` · ${input.paymentStatus}` : ''})
-${input.etaMinutes ? `Estimated Arrival: ~${input.etaMinutes} mins\n` : ''}${
+${input.etaMinutes ? `Estimated Arrival: ~${formatDurationEstimate(input.etaMinutes, 'en')}\n` : ''}${
     input.riderName
       ? `Rider: ${input.riderName}${input.riderPhone ? ` (${input.riderPhone})` : ''}\n`
       : ''
@@ -3369,6 +3475,109 @@ export function buildOpenRouterChatPayload(options: {
   return payload;
 }
 
+export function extractAiReplyText(content: unknown): string {
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+  if (Array.isArray(content)) {
+    const joined = content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object') {
+          const obj = part as Record<string, unknown>;
+          if (typeof obj.text === 'string') return obj.text;
+          if (typeof obj.content === 'string') return obj.content;
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    return joined;
+  }
+  if (content && typeof content === 'object') {
+    const obj = content as Record<string, unknown>;
+    if (typeof obj.text === 'string') return obj.text.trim();
+    if (typeof obj.content === 'string') return obj.content.trim();
+    if (typeof obj.message === 'string') return obj.message.trim();
+  }
+  return '';
+}
+
+export function coerceSafeErrorText(
+  err: unknown,
+  fallback = 'Something went wrong. Please try again.'
+): string {
+  if (typeof err === 'string') {
+    const clean = err.trim();
+    return clean || fallback;
+  }
+  if (err instanceof Error) {
+    const clean = typeof err.message === 'string' ? err.message.trim() : '';
+    return clean && clean !== '[object Object]' ? clean : fallback;
+  }
+  if (err && typeof err === 'object') {
+    const obj = err as Record<string, unknown>;
+    if (typeof obj.error === 'string' && obj.error.trim()) return obj.error.trim();
+    if (obj.error && typeof obj.error === 'object') {
+      const nested = (obj.error as Record<string, unknown>).message;
+      if (typeof nested === 'string' && nested.trim()) return nested.trim();
+    }
+    if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim();
+  }
+  return fallback;
+}
+
+export function sanitizeAiChatHistory(
+  messages: Array<{
+    role: 'user' | 'assistant' | 'model';
+    text: unknown;
+    reasoningDetails?: unknown;
+    reasoning_details?: unknown;
+  }>
+): Array<{ role: 'user' | 'model'; text: string; reasoning_details?: unknown }> {
+  if (!Array.isArray(messages)) return [];
+  const cleaned: Array<{ role: 'user' | 'model'; text: string; reasoning_details?: unknown }> = [];
+  for (const item of messages.slice(-8)) {
+    if (!item) continue;
+    const text = extractAiReplyText(item.text).slice(0, 2800);
+    if (!text) continue;
+    const role: 'user' | 'model' = item.role === 'user' ? 'user' : 'model';
+    const reasoning =
+      role === 'model'
+        ? item.reasoning_details !== undefined
+          ? item.reasoning_details
+          : item.reasoningDetails
+        : undefined;
+    cleaned.push({
+      role,
+      text,
+      ...(reasoning !== undefined ? { reasoning_details: reasoning } : {}),
+    });
+  }
+  return cleaned;
+}
+
+export function filterGeminiCandidateModels(preferredModel?: string): string[] {
+  const cleanPreferred = String(preferredModel || '').trim();
+  const isValidGeminiModel =
+    Boolean(cleanPreferred) &&
+    /^gemini-/i.test(cleanPreferred) &&
+    !cleanPreferred.includes('gemini-2.5') &&
+    !cleanPreferred.includes('gemini-1.5') &&
+    !cleanPreferred.includes('gemini-2.0');
+
+  return Array.from(
+    new Set(
+      [
+        ...(isValidGeminiModel ? [cleanPreferred] : []),
+        'gemini-4-hydrogen',
+        'gemini-3.1-flash-lite',
+      ].filter(Boolean)
+    )
+  );
+}
+
 export function buildMessengerUrl(rawUrl?: string): string {
   const clean = String(rawUrl || '').trim();
   const fallback = 'https://www.facebook.com/messages/t/mdrakib.roni.1';
@@ -3726,17 +3935,53 @@ export function calculateRiderLegEtaMin(
 export function resolveRiderCashCollectAmount(
   paymentMethod: string,
   totalAmount: number,
-  editedAmount?: number | null
+  editedAmount?: number | null,
+  options?: {
+    paymentSplitMode?: string | null;
+    cashDueToRider?: number | null;
+  }
 ): {
   isCod: boolean;
+  isDeliveryCashOnly: boolean;
   amountToCollect: number;
   statusLabelEn: string;
   statusLabelBn: string;
 } {
   const isCod = String(paymentMethod || '').toLowerCase() === 'cod';
+  const splitMode = String(options?.paymentSplitMode || '').toLowerCase();
+  const hasDeliveryCashSplit = splitMode === 'online_food_cash_delivery';
+
+  if (hasDeliveryCashSplit && !isCod) {
+    const due =
+      typeof options?.cashDueToRider === 'number' && Number.isFinite(options.cashDueToRider)
+        ? Math.max(0, Math.round(options.cashDueToRider))
+        : 0;
+    const finalAmount =
+      editedAmount !== null && editedAmount !== undefined && Number.isFinite(Number(editedAmount))
+        ? Math.max(0, Math.round(Number(editedAmount)))
+        : due;
+    if (finalAmount <= 0) {
+      return {
+        isCod: false,
+        isDeliveryCashOnly: true,
+        amountToCollect: 0,
+        statusLabelEn: 'Food paid online · Free delivery',
+        statusLabelBn: 'খাবার অনলাইনে পরিশোধিত · ফ্রি ডেলিভারি',
+      };
+    }
+    return {
+      isCod: true,
+      isDeliveryCashOnly: true,
+      amountToCollect: finalAmount,
+      statusLabelEn: 'Collect delivery charge cash',
+      statusLabelBn: 'রাইডার ডেলিভারি চার্জ ক্যাশ নিন',
+    };
+  }
+
   if (!isCod) {
     return {
       isCod: false,
+      isDeliveryCashOnly: false,
       amountToCollect: 0,
       statusLabelEn: 'Paid online',
       statusLabelBn: 'অনলাইনে পরিশোধিত',
@@ -3749,6 +3994,7 @@ export function resolveRiderCashCollectAmount(
       : base;
   return {
     isCod: true,
+    isDeliveryCashOnly: false,
     amountToCollect: finalAmount,
     statusLabelEn: 'Collect cash',
     statusLabelBn: 'ক্যাশ সংগ্রহ করুন',
@@ -3980,8 +4226,1130 @@ export function buildBranchRestaurantNames(
   };
 }
 
+export type BangladeshDeliveryServiceCode =
+  | 'pathao_food'
+  | 'foodora_express'
+  | 'steadfast'
+  | 'redx'
+  | 'paperfly'
+  | 'restaurant_fleet';
 
+export interface BangladeshDeliveryServiceMeta {
+  code: BangladeshDeliveryServiceCode;
+  nameEn: string;
+  nameBn: string;
+  mode: DeliveryMode;
+  minBaseFee: number;
+  etaOffsetMin: number;
+  coverageNoteEn: string;
+  coverageNoteBn: string;
+}
 
+export const BANGLADESH_DELIVERY_SERVICES: BangladeshDeliveryServiceMeta[] = [
+  {
+    code: 'pathao_food',
+    nameEn: 'Pathao Food & Courier',
+    nameBn: 'পাঠাও ফুড ও কুরিয়ার',
+    mode: 'third_party',
+    minBaseFee: 55,
+    etaOffsetMin: 2,
+    coverageNoteEn: 'Instant Pathao Food / Parcel rider across Bangladesh',
+    coverageNoteBn: 'পাঠাও ফুড/কুরিয়ারের মাধ্যমে সারা বাংলাদেশে দ্রুত ডেলিভারি',
+  },
+  {
+    code: 'foodora_express',
+    nameEn: 'Foodora Express Rider',
+    nameBn: 'ফুডোরা এক্সপ্রেস রাইডার',
+    mode: 'platform',
+    minBaseFee: 35,
+    etaOffsetMin: 0,
+    coverageNoteEn: 'Dedicated live GPS food rider fleet',
+    coverageNoteBn: 'লাইভ জিপিএস ট্র্যাকিংসহ নিজস্ব ফুড রাইডার',
+  },
+  {
+    code: 'steadfast',
+    nameEn: 'Steadfast Courier BD',
+    nameBn: 'স্টেডফাস্ট কুরিয়ার বিডি',
+    mode: 'third_party',
+    minBaseFee: 60,
+    etaOffsetMin: 5,
+    coverageNoteEn: 'Nationwide 64-district food & parcel partner',
+    coverageNoteBn: '৬৪ জেলায় স্টেডফাস্ট কুরিয়ার ডেলিভারি সাপোর্ট',
+  },
+  {
+    code: 'redx',
+    nameEn: 'RedX Delivery BD',
+    nameBn: 'রেডএক্স ডেলিভারি বিডি',
+    mode: 'third_party',
+    minBaseFee: 60,
+    etaOffsetMin: 5,
+    coverageNoteEn: 'Express zone dispatch via RedX Bangladesh',
+    coverageNoteBn: 'রেডএক্স-এর মাধ্যমে দ্রুত জোন ডেলিভারি',
+  },
+  {
+    code: 'paperfly',
+    nameEn: 'Paperfly / eCourier BD',
+    nameBn: 'পেপারফ্লাই / ই-কুরিয়ার',
+    mode: 'third_party',
+    minBaseFee: 65,
+    etaOffsetMin: 7,
+    coverageNoteEn: 'Doorstep courier coverage across Bangladesh',
+    coverageNoteBn: 'সারা দেশের হোম ডেলিভারি কুরিয়ার নেটওয়ার্ক',
+  },
+  {
+    code: 'restaurant_fleet',
+    nameEn: 'Restaurant Own Rider',
+    nameBn: 'রেস্টুরেন্টের নিজস্ব রাইডার',
+    mode: 'restaurant',
+    minBaseFee: 30,
+    etaOffsetMin: 0,
+    coverageNoteEn: 'Dispatched directly by the restaurant kitchen',
+    coverageNoteBn: 'সরাসরি রেস্টুরেন্টের নিজস্ব রাইডার দ্বারা ডেলিভারি',
+  },
+];
 
+export function getBangladeshDeliveryServiceMeta(
+  code?: string | null
+): BangladeshDeliveryServiceMeta {
+  const clean = String(code || '').trim().toLowerCase();
+  return (
+    BANGLADESH_DELIVERY_SERVICES.find((s) => s.code === clean) ||
+    BANGLADESH_DELIVERY_SERVICES[0]
+  );
+}
+
+export function selectAutoBangladeshiDeliveryService(options: {
+  restaurantDeliveryMode?: DeliveryMode | null;
+  preferredServiceCode?: string | null;
+  deliveryModeOverride?: DeliveryMode | null;
+  pathaoEnabled?: boolean;
+}): BangladeshDeliveryServiceMeta {
+  const cleanPreferred = String(options.preferredServiceCode || '').trim().toLowerCase();
+  if (cleanPreferred) {
+    const matched = BANGLADESH_DELIVERY_SERVICES.find((s) => s.code === cleanPreferred);
+    if (matched) return matched;
+  }
+
+  const targetMode = options.deliveryModeOverride || options.restaurantDeliveryMode || 'third_party';
+  if (targetMode === 'third_party') {
+    return options.pathaoEnabled === false
+      ? getBangladeshDeliveryServiceMeta('steadfast')
+      : getBangladeshDeliveryServiceMeta('pathao_food');
+  }
+  if (targetMode === 'restaurant') {
+    return getBangladeshDeliveryServiceMeta('restaurant_fleet');
+  }
+  return getBangladeshDeliveryServiceMeta('foodora_express');
+}
+
+export interface MapRouteTelemetry {
+  distanceKm: number;
+  etaMinutes: number;
+  mode: 'rider' | 'route';
+}
+
+export function computeMapRouteTelemetry(input: {
+  center: { lat: number; lng: number };
+  secondaryPoint?: { lat: number; lng: number } | null;
+  riderPoint?: { lat: number; lng: number } | null;
+  riderTarget?: { lat: number; lng: number } | null;
+  status?: string | null;
+  liveDistanceKm?: number | null;
+  liveEtaMinutes?: number | null;
+  vehicleMode?: DeliveryVehicleMode | string | null;
+}): MapRouteTelemetry | null {
+  const hasCenter =
+    Number.isFinite(input.center?.lat) && Number.isFinite(input.center?.lng);
+  if (!hasCenter) return null;
+
+  const hasRider =
+    Boolean(input.riderPoint) &&
+    Number.isFinite(input.riderPoint?.lat) &&
+    Number.isFinite(input.riderPoint?.lng);
+  const hasSecondary =
+    Boolean(input.secondaryPoint) &&
+    Number.isFinite(input.secondaryPoint?.lat) &&
+    Number.isFinite(input.secondaryPoint?.lng);
+
+  if (!hasRider && !hasSecondary) {
+    return null;
+  }
+
+  let computedDistance = 0;
+  let computedEta = 0;
+  let mode: 'rider' | 'route' = 'route';
+
+  if (hasRider && input.riderPoint) {
+    mode = 'rider';
+    const target =
+      input.riderTarget &&
+      Number.isFinite(input.riderTarget.lat) &&
+      Number.isFinite(input.riderTarget.lng)
+        ? input.riderTarget
+        : input.center;
+    const live = calculateLiveRiderEta(
+      input.riderPoint.lat,
+      input.riderPoint.lng,
+      target.lat,
+      target.lng,
+      input.status || undefined
+    );
+    computedDistance = live.remainingKm;
+    if (input.vehicleMode) {
+      const normalized = normalizeDeliveryVehicleMode(input.vehicleMode);
+      const vehicleAdjusted = computeVehicleAdjustedDurations({
+        vehicleMode: normalized,
+        distanceMeters: Math.max(100, computedDistance * 1000),
+        durationSeconds: live.etaMinutes * 60,
+        staticDurationSeconds: Math.round(live.etaMinutes * 60 * 0.8),
+        routeMatchesVehicle: normalized !== 'bicycle' && normalized !== 'walking',
+      });
+      computedEta = Math.max(2, Math.round(vehicleAdjusted.effectiveSec / 60));
+    } else {
+      computedEta = live.etaMinutes;
+    }
+  } else if (hasSecondary && input.secondaryPoint) {
+    mode = 'route';
+    computedDistance =
+      Math.round(
+        haversineDistanceKm(
+          input.secondaryPoint.lat,
+          input.secondaryPoint.lng,
+          input.center.lat,
+          input.center.lng
+        ) * 100
+      ) / 100;
+    const baseEta = Math.max(5, Math.round((computedDistance / 22) * 60 + 4));
+    if (input.vehicleMode) {
+      const normalized = normalizeDeliveryVehicleMode(input.vehicleMode);
+      const vehicleAdjusted = computeVehicleAdjustedDurations({
+        vehicleMode: normalized,
+        distanceMeters: Math.max(100, computedDistance * 1000),
+        durationSeconds: baseEta * 60,
+        staticDurationSeconds: Math.round(baseEta * 60 * 0.8),
+        routeMatchesVehicle: normalized !== 'bicycle' && normalized !== 'walking',
+      });
+      computedEta = Math.max(2, Math.round(vehicleAdjusted.effectiveSec / 60));
+    } else {
+      computedEta = baseEta;
+    }
+  }
+
+  const finalDistance =
+    typeof input.liveDistanceKm === 'number' &&
+    Number.isFinite(input.liveDistanceKm) &&
+    input.liveDistanceKm >= 0
+      ? Math.round(input.liveDistanceKm * 100) / 100
+      : computedDistance;
+
+  const finalEta =
+    typeof input.liveEtaMinutes === 'number' &&
+    Number.isFinite(input.liveEtaMinutes) &&
+    input.liveEtaMinutes >= 0
+      ? Math.round(input.liveEtaMinutes)
+      : computedEta;
+
+  return {
+    distanceKm: finalDistance,
+    etaMinutes: finalEta,
+    mode,
+  };
+}
+
+export type TrafficSeverity = 'clear' | 'moderate' | 'heavy';
+
+export type DeliveryVehicleMode = 'bicycle' | 'motorbike' | 'auto' | 'car' | 'walking';
+
+export interface DeliveryVehicleMeta {
+  mode: DeliveryVehicleMode;
+  labelEn: string;
+  labelBn: string;
+  googleTravelMode: 'BICYCLING' | 'DRIVING' | 'WALKING';
+  osrmProfile: 'cycling' | 'driving' | 'foot';
+  avgSpeedKmh: number;
+  isBetaRoute: boolean;
+}
+
+export const DELIVERY_VEHICLE_MODES: ReadonlyArray<DeliveryVehicleMeta> = [
+  {
+    mode: 'bicycle',
+    labelEn: 'Cycle',
+    labelBn: 'সাইকেল',
+    googleTravelMode: 'BICYCLING',
+    osrmProfile: 'cycling',
+    avgSpeedKmh: 14.5,
+    isBetaRoute: true,
+  },
+  {
+    mode: 'motorbike',
+    labelEn: 'Motorbike',
+    labelBn: 'বাইক',
+    googleTravelMode: 'DRIVING',
+    osrmProfile: 'driving',
+    avgSpeedKmh: 27,
+    isBetaRoute: true,
+  },
+  {
+    mode: 'auto',
+    labelEn: 'Auto / CNG',
+    labelBn: 'অটো / সিএনজি',
+    googleTravelMode: 'DRIVING',
+    osrmProfile: 'driving',
+    avgSpeedKmh: 20,
+    isBetaRoute: false,
+  },
+  {
+    mode: 'car',
+    labelEn: 'Car',
+    labelBn: 'গাড়ি',
+    googleTravelMode: 'DRIVING',
+    osrmProfile: 'driving',
+    avgSpeedKmh: 26,
+    isBetaRoute: false,
+  },
+  {
+    mode: 'walking',
+    labelEn: 'Walk',
+    labelBn: 'পায়ে হেঁটে',
+    googleTravelMode: 'WALKING',
+    osrmProfile: 'foot',
+    avgSpeedKmh: 4.8,
+    isBetaRoute: true,
+  },
+];
+
+export function normalizeDeliveryVehicleMode(
+  vehicleType: string | null | undefined
+): DeliveryVehicleMode {
+  const clean = String(vehicleType || '').trim().toLowerCase();
+  if (!clean) return 'motorbike';
+  if (isBicycleVehicleType(clean)) return 'bicycle';
+  if (
+    clean.includes('walk') ||
+    clean.includes('foot') ||
+    clean.includes('পায়ে') ||
+    clean.includes('হেঁটে')
+  ) {
+    return 'walking';
+  }
+  if (
+    clean.includes('auto') ||
+    clean.includes('cng') ||
+    clean.includes('rickshaw') ||
+    clean.includes('easybike') ||
+    clean.includes('অটো') ||
+    clean.includes('সিএনজি') ||
+    clean.includes('রিকশা')
+  ) {
+    return 'auto';
+  }
+  if (
+    clean.includes('car') ||
+    clean.includes('sedan') ||
+    clean.includes('pickup') ||
+    clean.includes('van') ||
+    clean.includes('truck') ||
+    clean.includes('micro') ||
+    clean.includes('গাড়ি') ||
+    clean.includes('গাড়ি') ||
+    clean.includes('কার')
+  ) {
+    return 'car';
+  }
+  return 'motorbike';
+}
+
+export function getDeliveryVehicleMeta(mode: DeliveryVehicleMode): DeliveryVehicleMeta {
+  return DELIVERY_VEHICLE_MODES.find((m) => m.mode === mode) || DELIVERY_VEHICLE_MODES[1];
+}
+
+export function computeVehicleAdjustedDurations(input: {
+  vehicleMode: DeliveryVehicleMode;
+  distanceMeters: number;
+  durationSeconds: number;
+  staticDurationSeconds: number;
+  routeMatchesVehicle?: boolean;
+}): { effectiveSec: number; staticSec: number } {
+  const distM = Math.max(0, input.distanceMeters);
+  const rawDur = Math.max(60, input.durationSeconds);
+  const rawStatic = Math.max(60, input.staticDurationSeconds || rawDur);
+  const rawDelay = Math.max(0, rawDur - rawStatic);
+
+  if (input.vehicleMode === 'bicycle') {
+    const cycleEstimateSec = Math.max(120, Math.round((distM / 1000 / 14.5) * 3600));
+    const baseStatic = input.routeMatchesVehicle ? rawStatic : cycleEstimateSec;
+    const baseDur = input.routeMatchesVehicle
+      ? Math.max(rawDur, Math.round(baseStatic + rawDelay * 0.25))
+      : Math.round(cycleEstimateSec + rawDelay * 0.25);
+    return { effectiveSec: baseDur, staticSec: baseStatic };
+  }
+
+  if (input.vehicleMode === 'walking') {
+    const walkEstimateSec = Math.max(120, Math.round((distM / 1000 / 4.8) * 3600));
+    const baseStatic = input.routeMatchesVehicle ? rawStatic : walkEstimateSec;
+    return { effectiveSec: input.routeMatchesVehicle ? rawDur : walkEstimateSec, staticSec: baseStatic };
+  }
+
+  if (input.vehicleMode === 'motorbike') {
+    const motoOpenSec = Math.max(
+      120,
+      Math.min(rawStatic, Math.round((distM / 1000 / 28) * 3600))
+    );
+    const filteredDelay = Math.round(rawDelay * 0.55);
+    return { effectiveSec: motoOpenSec + filteredDelay, staticSec: motoOpenSec };
+  }
+
+  if (input.vehicleMode === 'auto') {
+    const autoOpenSec = Math.max(
+      rawStatic,
+      Math.round((distM / 1000 / 20) * 3600)
+    );
+    const autoDelay = Math.round(rawDelay * 1.05);
+    return { effectiveSec: autoOpenSec + autoDelay, staticSec: autoOpenSec };
+  }
+
+  return { effectiveSec: rawDur, staticSec: rawStatic };
+}
+
+export interface RouteDirectionStep {
+  instruction: string;
+  distanceMeters: number;
+  durationSeconds: number;
+  maneuver?: string;
+  roadName?: string;
+}
+
+export interface SpeedSegmentSummary {
+  normalCount: number;
+  slowCount: number;
+  jamCount: number;
+}
+
+export interface LiveRouteTrafficSummary {
+  distanceKm: number;
+  etaMinutes: number;
+  staticMinutes: number;
+  delayMinutes: number;
+  vehicleMode: DeliveryVehicleMode;
+  trafficSeverity: TrafficSeverity;
+  trafficLabelEn: string;
+  trafficLabelBn: string;
+  jamAreasTextEn: string;
+  jamAreasTextBn: string;
+  steps: RouteDirectionStep[];
+  speedSegments: SpeedSegmentSummary;
+  source: 'google_routes' | 'osrm' | 'estimated';
+}
+
+export function formatDirectionStepDistance(meters: number, lang: 'en' | 'bn' = 'en'): string {
+  const safeMeters = Number.isFinite(meters) && meters > 0 ? Math.round(meters) : 0;
+  if (safeMeters >= 1000) {
+    const km = (safeMeters / 1000).toFixed(1);
+    return lang === 'bn' ? `${km} কিমি` : `${km} km`;
+  }
+  return lang === 'bn' ? `${safeMeters} মি` : `${safeMeters} m`;
+}
+
+export function estimateDhakaPeakTrafficFactor(hour24?: number): number {
+  const h =
+    typeof hour24 === 'number' && Number.isFinite(hour24)
+      ? ((Math.floor(hour24) % 24) + 24) % 24
+      : (new Date().getUTCHours() + 6) % 24;
+  // Morning office rush (8-11 AM) and evening peak (5-10 PM) BD time
+  if ((h >= 8 && h <= 11) || (h >= 17 && h <= 21)) {
+    return 1.38;
+  }
+  // Daytime moderate city flow (12-4 PM)
+  if (h >= 12 && h <= 16) {
+    return 1.2;
+  }
+  return 1.06;
+}
+
+export function summarizeTrafficCongestion(input: {
+  distanceMeters: number;
+  durationSeconds: number;
+  staticDurationSeconds?: number | null;
+  speedLevels?: ReadonlyArray<string | null | undefined>;
+  steps?: ReadonlyArray<RouteDirectionStep>;
+  source?: 'google_routes' | 'osrm' | 'estimated';
+  peakFactorOverride?: number;
+  vehicleMode?: DeliveryVehicleMode;
+  routeMatchesVehicle?: boolean;
+}): LiveRouteTrafficSummary {
+  const vehicleMode: DeliveryVehicleMode = input.vehicleMode || 'car';
+  const safeDistM =
+    Number.isFinite(input.distanceMeters) && input.distanceMeters >= 0
+      ? input.distanceMeters
+      : 0;
+  const distanceKm = Math.round((safeDistM / 1000) * 100) / 100;
+
+  const rawStaticSec =
+    typeof input.staticDurationSeconds === 'number' &&
+    Number.isFinite(input.staticDurationSeconds) &&
+    input.staticDurationSeconds > 0
+      ? input.staticDurationSeconds
+      : input.durationSeconds;
+  const safeDurSec =
+    Number.isFinite(input.durationSeconds) && input.durationSeconds > 0
+      ? input.durationSeconds
+      : Math.max(120, Math.round(distanceKm * 180));
+  const safeStaticSec =
+    Number.isFinite(rawStaticSec) && rawStaticSec > 0 ? rawStaticSec : safeDurSec;
+
+  const speedSegments: SpeedSegmentSummary = {
+    normalCount: 0,
+    slowCount: 0,
+    jamCount: 0,
+  };
+  for (const rawSpeed of input.speedLevels || []) {
+    const level = String(rawSpeed || '').toUpperCase();
+    if (level === 'TRAFFIC_JAM') speedSegments.jamCount += 1;
+    else if (level === 'SLOW') speedSegments.slowCount += 1;
+    else if (level === 'NORMAL') speedSegments.normalCount += 1;
+  }
+
+  let preVehicleDurSec = safeDurSec;
+  if (
+    input.source !== 'google_routes' &&
+    Math.abs(safeDurSec - safeStaticSec) < 5 &&
+    distanceKm > 0.2
+  ) {
+    const factor =
+      typeof input.peakFactorOverride === 'number' && input.peakFactorOverride >= 1
+        ? input.peakFactorOverride
+        : estimateDhakaPeakTrafficFactor();
+    preVehicleDurSec = Math.round(safeStaticSec * factor);
+  }
+
+  const adjusted = computeVehicleAdjustedDurations({
+    vehicleMode,
+    distanceMeters: safeDistM,
+    durationSeconds: preVehicleDurSec,
+    staticDurationSeconds: safeStaticSec,
+    routeMatchesVehicle:
+      input.routeMatchesVehicle ??
+      (vehicleMode !== 'bicycle' && vehicleMode !== 'walking'),
+  });
+
+  const etaMinutes = Math.max(2, Math.round(adjusted.effectiveSec / 60));
+  const staticMinutes = Math.max(2, Math.round(adjusted.staticSec / 60));
+  const delayMinutes = Math.max(0, etaMinutes - staticMinutes);
+  const ratio = adjusted.staticSec > 0 ? adjusted.effectiveSec / adjusted.staticSec : 1;
+
+  let trafficSeverity: TrafficSeverity = 'clear';
+  if (speedSegments.jamCount > 0 || delayMinutes >= 6 || ratio >= 1.35) {
+    trafficSeverity = 'heavy';
+  } else if (speedSegments.slowCount > 0 || delayMinutes >= 2 || ratio >= 1.15) {
+    trafficSeverity = 'moderate';
+  }
+
+  const delayFormattedEn = delayMinutes > 0 ? formatDurationEstimate(delayMinutes, 'en', 'compact') : '';
+  const delayFormattedBn = delayMinutes > 0 ? formatDurationEstimate(delayMinutes, 'bn', 'compact') : '';
+  const delayTagEn = delayMinutes > 0 ? ` (+${delayFormattedEn} delay)` : '';
+  const delayTagBn = delayMinutes > 0 ? ` (+${delayFormattedBn} দেরি)` : '';
+
+  const trafficLabelEn =
+    trafficSeverity === 'heavy'
+      ? `Heavy Jam${delayTagEn}`
+      : trafficSeverity === 'moderate'
+      ? `Slow Traffic${delayTagEn}`
+      : 'Traffic Clear';
+
+  const trafficLabelBn =
+    trafficSeverity === 'heavy'
+      ? `রাস্তায় ভারী জ্যাম${delayTagBn}`
+      : trafficSeverity === 'moderate'
+      ? `মাঝারি যানজট${delayTagBn}`
+      : 'যানজট নেই (ফাঁকা)';
+
+  const jamAreasTextEn =
+    speedSegments.jamCount > 0 || speedSegments.slowCount > 0
+      ? `${speedSegments.jamCount} jam segment(s) · ${speedSegments.slowCount} slow zone(s) · ${speedSegments.normalCount} clear`
+      : trafficSeverity === 'heavy'
+      ? `Congestion detected along main intersections (${delayFormattedEn} slower than normal)`
+      : trafficSeverity === 'moderate'
+      ? `Moderate urban traffic along route (${delayFormattedEn} slower)`
+      : 'Smooth traffic flow along the full delivery route';
+
+  const jamAreasTextBn =
+    speedSegments.jamCount > 0 || speedSegments.slowCount > 0
+      ? `${speedSegments.jamCount}টি ভারী জ্যাম · ${speedSegments.slowCount}টি ধীরগতি · ${speedSegments.normalCount}টি ফাঁকা অংশ`
+      : trafficSeverity === 'heavy'
+      ? `মূল মোড়ে যানজট রয়েছে (স্বাভাবিকের চেয়ে ${delayFormattedBn} বেশি)`
+      : trafficSeverity === 'moderate'
+      ? `রাস্তায় মাঝারি যানজট রয়েছে (+${delayFormattedBn})`
+      : 'সম্পূর্ণ রুটে চলাচল স্বাভাবিক ও যানজটমুক্ত';
+
+  return {
+    distanceKm,
+    etaMinutes,
+    staticMinutes,
+    delayMinutes,
+    vehicleMode,
+    trafficSeverity,
+    trafficLabelEn,
+    trafficLabelBn,
+    jamAreasTextEn,
+    jamAreasTextBn,
+    steps: [...(input.steps || [])].slice(0, 12),
+    speedSegments,
+    source: input.source || 'estimated',
+  };
+}
+
+export function buildOsrmDirectionInstruction(input: {
+  type?: string;
+  modifier?: string;
+  roadName?: string;
+}): string {
+  const type = String(input.type || '').toLowerCase();
+  const modifier = String(input.modifier || '').replace(/_/g, ' ').trim();
+  const road = String(input.roadName || '').trim();
+  const onto = road ? ` onto ${road}` : '';
+  const onRoad = road ? ` on ${road}` : '';
+
+  if (type === 'arrive') return 'Arrive at destination';
+  if (type === 'depart') return `Head ${modifier || 'straight'}${onRoad}`;
+  if (type === 'roundabout' || type === 'rotary') {
+    return `Enter roundabout and continue${onto}`;
+  }
+  if (type === 'merge') return `Merge ${modifier || ''}${onto}`.replace(/\s+/g, ' ').trim();
+  if (type === 'fork') return `Keep ${modifier || 'straight'} at fork${onto}`;
+  if (type === 'end of road') return `At end of road, turn ${modifier || 'ahead'}${onto}`;
+  if (type === 'turn' || type === 'new name' || type === 'continue') {
+    if (modifier === 'straight' || modifier === '') {
+      return road ? `Continue onto ${road}` : 'Continue straight';
+    }
+    return `Turn ${modifier}${onto}`;
+  }
+  return road ? `Follow ${road}` : 'Continue along route';
+}
+
+export interface DhakaZonePresetMeta {
+  code: string;
+  name: string;
+  nameBn: string;
+  label: string;
+  defaultDeliveryFee: number;
+  keywords: string[];
+}
+
+export const DHAKA_ZONE_PRESETS: ReadonlyArray<DhakaZonePresetMeta> = [
+  {
+    code: 'ZONE 01',
+    name: 'GULSHAN',
+    nameBn: 'গুলশান',
+    label: 'ZONE 01 — GULSHAN',
+    defaultDeliveryFee: 60,
+    keywords: ['gulshan', 'niketan', 'shahjadpur', 'গুলশান', 'নিকেতন', 'শাহজাদপুর', 'zone 01'],
+  },
+  {
+    code: 'ZONE 02',
+    name: 'BANANI',
+    nameBn: 'বনানী',
+    label: 'ZONE 02 — BANANI',
+    defaultDeliveryFee: 60,
+    keywords: ['banani', 'kakoli', 'chairman bari', 'বনানী', 'কাকলী', 'zone 02'],
+  },
+  {
+    code: 'ZONE 03',
+    name: 'DHANMONDI',
+    nameBn: 'ধানমন্ডি',
+    label: 'ZONE 03 — DHANMONDI',
+    defaultDeliveryFee: 60,
+    keywords: ['dhanmondi', 'satmasjid', 'jigatola', 'kalabagan', 'ধানমন্ডি', 'জিগাতলা', 'কলাবাগান', 'zone 03'],
+  },
+  {
+    code: 'ZONE 04',
+    name: 'MIRPUR',
+    nameBn: 'মিরপুর',
+    label: 'ZONE 04 — MIRPUR',
+    defaultDeliveryFee: 60,
+    keywords: ['mirpur', 'pallabi', 'kazipara', 'shewrapara', 'মিরপুর', 'পল্লবী', 'কাজীপাড়া', 'zone 04'],
+  },
+  {
+    code: 'ZONE 05',
+    name: 'UTTARA',
+    nameBn: 'উত্তরা',
+    label: 'ZONE 05 — UTTARA',
+    defaultDeliveryFee: 65,
+    keywords: ['uttara', 'rajlaxmi', 'jashimuddin', 'abdullahpur', 'উত্তরা', 'রাজলক্ষ্মী', 'zone 05'],
+  },
+  {
+    code: 'ZONE 06',
+    name: 'MOHAMMADPUR',
+    nameBn: 'মোহাম্মদপুর',
+    label: 'ZONE 06 — MOHAMMADPUR',
+    defaultDeliveryFee: 60,
+    keywords: ['mohammadpur', 'town hall', 'bosila', 'adabor', 'shyamoli', 'মোহাম্মদপুর', 'আদাবর', 'শ্যামলী', 'zone 06'],
+  },
+  {
+    code: 'ZONE 07',
+    name: 'BASHUNDHARA',
+    nameBn: 'বসুন্ধরা',
+    label: 'ZONE 07 — BASHUNDHARA',
+    defaultDeliveryFee: 65,
+    keywords: ['bashundhara', 'jamuna future', 'kuril', 'vatara', 'বসুন্ধরা', 'কুড়িল', 'ভাটারা', 'zone 07'],
+  },
+  {
+    code: 'ZONE 08',
+    name: 'BADDA',
+    nameBn: 'বাড্ডা',
+    label: 'ZONE 08 — BADDA',
+    defaultDeliveryFee: 60,
+    keywords: ['badda', 'merul', 'rampura', 'aftabnagar', 'বাড্ডা', 'রামপুরা', 'আফতাবনগর', 'zone 08'],
+  },
+  {
+    code: 'ZONE 09',
+    name: 'MOTIJHEEL',
+    nameBn: 'মতিঝিল',
+    label: 'ZONE 09 — MOTIJHEEL',
+    defaultDeliveryFee: 60,
+    keywords: ['motijheel', 'paltan', 'fakirapool', 'arambagh', 'kamalapur', 'মতিঝিল', 'পল্টন', 'কমলাপুর', 'zone 09'],
+  },
+  {
+    code: 'ZONE 10',
+    name: 'OLD DHAKA',
+    nameBn: 'পুরান ঢাকা',
+    label: 'ZONE 10 — OLD DHAKA',
+    defaultDeliveryFee: 60,
+    keywords: ['old dhaka', 'chawkbazar', 'bangshal', 'lalbagh', 'wari', 'sutrapur', 'পুরান ঢাকা', 'চকবাজার', 'লালবাগ', 'ওয়ারী', 'zone 10'],
+  },
+  {
+    code: 'ZONE 11',
+    name: 'TEJGAON / FARMGATE',
+    nameBn: 'তেজগাঁও / ফার্মগেট',
+    label: 'ZONE 11 — TEJGAON / FARMGATE',
+    defaultDeliveryFee: 55,
+    keywords: ['tejgaon', 'farmgate', 'karwan', 'kawran', 'তেজগাঁও', 'ফার্মগেট', 'কারওয়ান', 'zone 11'],
+  },
+  {
+    code: 'ZONE 12',
+    name: 'KHILGAON',
+    nameBn: 'খিলগাঁও',
+    label: 'ZONE 12 — KHILGAON',
+    defaultDeliveryFee: 60,
+    keywords: ['khilgaon', 'taltola', 'malibagh', 'goran', 'খিলগাঁও', 'মালিবাগ', 'গোরান', 'zone 12'],
+  },
+];
+
+export interface DeliveryFinancialConfig {
+  paymentModel: 'online_food_cash_delivery';
+  zoneFees: Record<string, number>;
+  distancePricing: {
+    enabled: boolean;
+    baseDistanceKm: number;
+    baseFee: number;
+    perKmFee: number;
+    minFee: number;
+    maxFee: number;
+  };
+  riderEarningRule: {
+    mode: 'percentage' | 'fixed';
+    value: number; // percentage 0..100 of delivery charge OR fixed BDT per delivery
+  };
+  settlementRules: {
+    maxOutstandingLimit: number;
+    autoBlockDispatchAboveLimit: boolean;
+    requireCashConfirmation: boolean;
+    settlementCycleLabel: string;
+    settlementInstructions: string;
+  };
+}
+
+export const DEFAULT_DELIVERY_FINANCIAL_CONFIG: DeliveryFinancialConfig = {
+  paymentModel: 'online_food_cash_delivery',
+  zoneFees: Object.fromEntries(DHAKA_ZONE_PRESETS.map((z) => [z.code, z.defaultDeliveryFee])),
+  distancePricing: {
+    enabled: true,
+    baseDistanceKm: 3,
+    baseFee: 60,
+    perKmFee: 10,
+    minFee: 40,
+    maxFee: 180,
+  },
+  riderEarningRule: {
+    mode: 'percentage',
+    value: 75, // ৳45 on ৳60 delivery charge; ৳15 Foodora platform commission
+  },
+  settlementRules: {
+    maxOutstandingLimit: 500,
+    autoBlockDispatchAboveLimit: true,
+    requireCashConfirmation: true,
+    settlementCycleLabel: 'Daily / When Outstanding Reaches Cap',
+    settlementInstructions:
+      'Collect the delivery charge directly in cash from customers on delivery. Settle Foodora commission balance via Cash / bKash / Nagad to Admin when due. No automated payout for rider-collected cash.',
+  },
+};
+
+export function mergeDeliveryFinancialConfig(
+  raw?: Partial<DeliveryFinancialConfig> | Record<string, unknown> | null
+): DeliveryFinancialConfig {
+  const input = (raw || {}) as Partial<DeliveryFinancialConfig>;
+  const rawZoneFees = (input.zoneFees || {}) as Record<string, unknown>;
+  const mergedZoneFees: Record<string, number> = { ...DEFAULT_DELIVERY_FINANCIAL_CONFIG.zoneFees };
+  for (const preset of DHAKA_ZONE_PRESETS) {
+    const val = Number(rawZoneFees[preset.code]);
+    if (Number.isFinite(val) && val >= 0 && val <= 1000) {
+      mergedZoneFees[preset.code] = Math.round(val);
+    }
+  }
+  const dp = (input.distancePricing || {}) as Partial<DeliveryFinancialConfig['distancePricing']>;
+  const re = (input.riderEarningRule || {}) as Partial<DeliveryFinancialConfig['riderEarningRule']>;
+  const sr = (input.settlementRules || {}) as Partial<DeliveryFinancialConfig['settlementRules']>;
+
+  const mode = re.mode === 'fixed' ? 'fixed' : 'percentage';
+  const rawVal = Number(re.value);
+  const clampedValue = Number.isFinite(rawVal)
+    ? mode === 'percentage'
+      ? Math.max(0, Math.min(100, Math.round(rawVal)))
+      : Math.max(0, Math.round(rawVal))
+    : DEFAULT_DELIVERY_FINANCIAL_CONFIG.riderEarningRule.value;
+
+  return {
+    paymentModel: 'online_food_cash_delivery',
+    zoneFees: mergedZoneFees,
+    distancePricing: {
+      enabled: typeof dp.enabled === 'boolean' ? dp.enabled : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.enabled,
+      baseDistanceKm:
+        typeof dp.baseDistanceKm === 'number' && Number.isFinite(dp.baseDistanceKm) && dp.baseDistanceKm >= 0
+          ? Math.min(30, dp.baseDistanceKm)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.baseDistanceKm,
+      baseFee:
+        typeof dp.baseFee === 'number' && Number.isFinite(dp.baseFee) && dp.baseFee >= 0
+          ? Math.round(dp.baseFee)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.baseFee,
+      perKmFee:
+        typeof dp.perKmFee === 'number' && Number.isFinite(dp.perKmFee) && dp.perKmFee >= 0
+          ? Math.round(dp.perKmFee)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.perKmFee,
+      minFee:
+        typeof dp.minFee === 'number' && Number.isFinite(dp.minFee) && dp.minFee >= 0
+          ? Math.round(dp.minFee)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.minFee,
+      maxFee:
+        typeof dp.maxFee === 'number' && Number.isFinite(dp.maxFee) && dp.maxFee >= 10
+          ? Math.round(dp.maxFee)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.distancePricing.maxFee,
+    },
+    riderEarningRule: {
+      mode,
+      value: clampedValue,
+    },
+    settlementRules: {
+      maxOutstandingLimit:
+        typeof sr.maxOutstandingLimit === 'number' && Number.isFinite(sr.maxOutstandingLimit) && sr.maxOutstandingLimit >= 50
+          ? Math.round(sr.maxOutstandingLimit)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.maxOutstandingLimit,
+      autoBlockDispatchAboveLimit:
+        typeof sr.autoBlockDispatchAboveLimit === 'boolean'
+          ? sr.autoBlockDispatchAboveLimit
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.autoBlockDispatchAboveLimit,
+      requireCashConfirmation:
+        typeof sr.requireCashConfirmation === 'boolean'
+          ? sr.requireCashConfirmation
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.requireCashConfirmation,
+      settlementCycleLabel:
+        typeof sr.settlementCycleLabel === 'string' && sr.settlementCycleLabel.trim()
+          ? sr.settlementCycleLabel.trim().slice(0, 120)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.settlementCycleLabel,
+      settlementInstructions:
+        typeof sr.settlementInstructions === 'string' && sr.settlementInstructions.trim()
+          ? sr.settlementInstructions.trim().slice(0, 500)
+          : DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules.settlementInstructions,
+    },
+  };
+}
+
+export function matchDhakaDeliveryZone(areaOrZoneText?: string | null): DhakaZonePresetMeta | null {
+  const clean = String(areaOrZoneText || '').trim().toLowerCase();
+  if (!clean) return null;
+  for (const preset of DHAKA_ZONE_PRESETS) {
+    if (
+      clean === preset.code.toLowerCase() ||
+      clean === preset.name.toLowerCase() ||
+      clean === preset.label.toLowerCase() ||
+      preset.keywords.some((kw) => clean.includes(kw))
+    ) {
+      return preset;
+    }
+  }
+  return null;
+}
+
+export function calculateZoneDistanceDeliveryFee(input: {
+  area?: string | null;
+  distanceKm?: number | null;
+  fallbackFee?: number | null;
+  config?: DeliveryFinancialConfig | null;
+}): {
+  deliveryFee: number;
+  zoneCode: string | null;
+  zoneName: string | null;
+  pricingSource: 'zone_plus_distance' | 'distance_rule' | 'zone_base' | 'fallback';
+} {
+  const cfg = mergeDeliveryFinancialConfig(input.config);
+  const matchedZone = matchDhakaDeliveryZone(input.area);
+  const zoneBaseFee = matchedZone
+    ? cfg.zoneFees[matchedZone.code] ?? matchedZone.defaultDeliveryFee
+    : undefined;
+  const distKm =
+    typeof input.distanceKm === 'number' && Number.isFinite(input.distanceKm) && input.distanceKm >= 0
+      ? input.distanceKm
+      : null;
+
+  const base = zoneBaseFee ?? cfg.distancePricing.baseFee ?? Math.max(0, Math.round(input.fallbackFee ?? 60));
+
+  if (cfg.distancePricing.enabled && distKm !== null) {
+    const extraKm = Math.max(0, distKm - cfg.distancePricing.baseDistanceKm);
+    const rawFee = Math.round(base + extraKm * cfg.distancePricing.perKmFee);
+    const clamped = Math.max(cfg.distancePricing.minFee, Math.min(cfg.distancePricing.maxFee, rawFee));
+    return {
+      deliveryFee: clamped,
+      zoneCode: matchedZone?.code || null,
+      zoneName: matchedZone?.name || null,
+      pricingSource: matchedZone ? 'zone_plus_distance' : 'distance_rule',
+    };
+  }
+
+  if (zoneBaseFee !== undefined) {
+    return {
+      deliveryFee: Math.max(0, Math.round(zoneBaseFee)),
+      zoneCode: matchedZone?.code || null,
+      zoneName: matchedZone?.name || null,
+      pricingSource: 'zone_base',
+    };
+  }
+
+  const fb =
+    typeof input.fallbackFee === 'number' && Number.isFinite(input.fallbackFee)
+      ? Math.max(0, Math.round(input.fallbackFee))
+      : cfg.distancePricing.baseFee;
+  return {
+    deliveryFee: fb,
+    zoneCode: null,
+    zoneName: null,
+    pricingSource: 'fallback',
+  };
+}
+
+export interface SplitOrderFinancialBreakdown extends OrderFinancialBreakdown {
+  paymentSplitMode: 'online_food_cash_delivery' | 'legacy_cod';
+  onlineFoodPayable: number;
+  cashDueToRider: number;
+  customerTotalCost: number;
+  riderEarningAmount: number;
+  foodoraDeliveryCommission: number;
+}
+
+export function calculateSplitOrderFinancials(
+  params: OrderFinancialParams & {
+    paymentMethod?: string | null;
+    riderEarningRule?: DeliveryFinancialConfig['riderEarningRule'] | null;
+  }
+): SplitOrderFinancialBreakdown {
+  const base = calculateOrderFinancials(params);
+  const method = String(params.paymentMethod || 'bkash').trim().toLowerCase();
+  const isLegacyCod = method === 'cod';
+  const rule = params.riderEarningRule || DEFAULT_DELIVERY_FINANCIAL_CONFIG.riderEarningRule;
+
+  let riderEarningAmount = 0;
+  let foodoraDeliveryCommission = 0;
+
+  if (base.deliveryFee > 0) {
+    if (rule.mode === 'fixed') {
+      riderEarningAmount = Math.min(base.deliveryFee, Math.max(0, Math.round(rule.value)));
+    } else {
+      const pct = Math.max(0, Math.min(100, Number(rule.value) || 0));
+      riderEarningAmount = Math.min(base.deliveryFee, Math.round((base.deliveryFee * pct) / 100));
+    }
+    foodoraDeliveryCommission = Math.max(0, base.deliveryFee - riderEarningAmount);
+  }
+
+  if (isLegacyCod) {
+    return {
+      ...base,
+      paymentSplitMode: 'legacy_cod',
+      onlineFoodPayable: 0,
+      cashDueToRider: base.totalPayable,
+      customerTotalCost: base.totalPayable,
+      riderEarningAmount,
+      foodoraDeliveryCommission,
+    };
+  }
+
+  const onlineFoodPayable = base.netFoodRevenue + base.serviceFee + base.taxAmount;
+  const cashDueToRider = base.deliveryFee;
+  const customerTotalCost = onlineFoodPayable + cashDueToRider;
+
+  return {
+    ...base,
+    paymentSplitMode: 'online_food_cash_delivery',
+    onlineFoodPayable,
+    cashDueToRider,
+    customerTotalCost,
+    riderEarningAmount,
+    foodoraDeliveryCommission,
+  };
+}
+
+export function canVendorProcessPrepaidOrder(order: {
+  paymentMethod?: string | null;
+  paymentStatus?: string | null;
+  paymentSplitMode?: string | null;
+  nextStatus?: string | null;
+}): { allowed: boolean; reason?: string } {
+  const next = String(order.nextStatus || '').trim().toLowerCase();
+  if (next === 'cancelled') {
+    return { allowed: true };
+  }
+  const method = String(order.paymentMethod || '').trim().toLowerCase();
+  const pStatus = String(order.paymentStatus || '').trim().toLowerCase();
+  if (method !== 'cod' && pStatus !== 'paid') {
+    return {
+      allowed: false,
+      reason:
+        'Online food payment must be verified before the restaurant or rider can process this order.',
+    };
+  }
+  return { allowed: true };
+}
+
+export interface RiderWalletLedgerSummary {
+  totalCashCollected: number;
+  totalRiderEarnings: number;
+  totalCommissionOwed: number;
+  totalCommissionSettled: number;
+  outstandingCommission: number;
+  deliveredCountFromLedger: number;
+}
+
+export function summarizeRiderWalletLedger(
+  entries: ReadonlyArray<{
+    entryType: string;
+    cashCollected?: number | null;
+    riderEarningDelta?: number | null;
+    commissionOwedDelta?: number | null;
+    commissionSettledDelta?: number | null;
+  }>
+): RiderWalletLedgerSummary {
+  let totalCashCollected = 0;
+  let totalRiderEarnings = 0;
+  let totalCommissionOwed = 0;
+  let totalCommissionSettled = 0;
+  let deliveredCountFromLedger = 0;
+
+  for (const e of entries) {
+    totalCashCollected += Number(e.cashCollected) || 0;
+    totalRiderEarnings += Number(e.riderEarningDelta) || 0;
+    totalCommissionOwed += Number(e.commissionOwedDelta) || 0;
+    totalCommissionSettled += Number(e.commissionSettledDelta) || 0;
+    if (e.entryType === 'delivery_earning') {
+      deliveredCountFromLedger += 1;
+    } else if (e.entryType === 'commission_reversal') {
+      deliveredCountFromLedger = Math.max(0, deliveredCountFromLedger - 1);
+    }
+  }
+
+  return {
+    totalCashCollected: Math.max(0, Math.round(totalCashCollected)),
+    totalRiderEarnings: Math.max(0, Math.round(totalRiderEarnings)),
+    totalCommissionOwed: Math.max(0, Math.round(totalCommissionOwed)),
+    totalCommissionSettled: Math.max(0, Math.round(totalCommissionSettled)),
+    outstandingCommission: Math.max(0, Math.round(totalCommissionOwed - totalCommissionSettled)),
+    deliveredCountFromLedger,
+  };
+}
+
+export function canRiderAcceptOrders(input: {
+  riderStatus?: string | null;
+  outstandingCommission?: number;
+  settlementRules?: DeliveryFinancialConfig['settlementRules'] | null;
+}): { allowed: boolean; reason?: string } {
+  const status = String(input.riderStatus || '').trim().toLowerCase();
+  if (status !== 'approved') {
+    return {
+      allowed: false,
+      reason:
+        status === 'suspended'
+          ? 'Your rider account is currently suspended. Contact Foodora Admin.'
+          : 'Your rider application is pending Admin approval for your Dhaka zone.',
+    };
+  }
+  const rules = input.settlementRules || DEFAULT_DELIVERY_FINANCIAL_CONFIG.settlementRules;
+  const outstanding = Math.max(0, Math.round(input.outstandingCommission || 0));
+  if (rules.autoBlockDispatchAboveLimit && outstanding > rules.maxOutstandingLimit) {
+    return {
+      allowed: false,
+      reason: `Outstanding Foodora commission (৳${outstanding}) exceeds limit (৳${rules.maxOutstandingLimit}). Please settle commission with Admin to unlock new deliveries.`,
+    };
+  }
+  return { allowed: true };
+}
+
+export interface DhakaZoneRiderCoverageItem {
+  zoneCode: string;
+  zoneName: string;
+  zoneNameBn: string;
+  zoneLabel: string;
+  approvedCount: number;
+  onlineCount: number;
+  pendingCount: number;
+  suspendedCount: number;
+  deliveryFee: number;
+  hasActiveCoverage: boolean;
+}
+
+export function summarizeDhakaZoneRiderCoverage(
+  ridersList: ReadonlyArray<{
+    zone?: string | null;
+    status?: string | null;
+    isAvailable?: boolean | null;
+  }>,
+  config?: DeliveryFinancialConfig | null
+): DhakaZoneRiderCoverageItem[] {
+  const merged = mergeDeliveryFinancialConfig(config);
+  const buckets = new Map<
+    string,
+    { approved: number; online: number; pending: number; suspended: number }
+  >();
+
+  for (const preset of DHAKA_ZONE_PRESETS) {
+    buckets.set(preset.code, { approved: 0, online: 0, pending: 0, suspended: 0 });
+  }
+
+  for (const rider of ridersList) {
+    const matched = matchDhakaDeliveryZone(rider.zone);
+    if (!matched) continue;
+    const bucket = buckets.get(matched.code);
+    if (!bucket) continue;
+    const status = String(rider.status || '').trim().toLowerCase();
+    if (status === 'approved') {
+      bucket.approved += 1;
+      if (rider.isAvailable) bucket.online += 1;
+    } else if (status === 'pending') {
+      bucket.pending += 1;
+    } else if (status === 'suspended') {
+      bucket.suspended += 1;
+    }
+  }
+
+  return DHAKA_ZONE_PRESETS.map((preset) => {
+    const bucket = buckets.get(preset.code) || { approved: 0, online: 0, pending: 0, suspended: 0 };
+    return {
+      zoneCode: preset.code,
+      zoneName: preset.name,
+      zoneNameBn: preset.nameBn,
+      zoneLabel: preset.label,
+      approvedCount: bucket.approved,
+      onlineCount: bucket.online,
+      pendingCount: bucket.pending,
+      suspendedCount: bucket.suspended,
+      deliveryFee: merged.zoneFees[preset.code] ?? preset.defaultDeliveryFee,
+      hasActiveCoverage: bucket.online > 0 || bucket.approved > 0,
+    };
+  });
+}
 
 
